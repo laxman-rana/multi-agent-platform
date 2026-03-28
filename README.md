@@ -1,6 +1,6 @@
 # Agents Project
 
-This repository is intended to host multiple AI agents across different business domains. It provides a shared Python package layout for agent implementations, LLM providers, telemetry integrations, and agent-specific tools.
+This repository is intended to host multiple AI agents across different business domains. It provides a shared Python package layout for agent implementations, LLM providers, observability integrations, and agent-specific tools.
 
 The current implemented example is an e-commerce customer-support agent, but the repository is not limited to e-commerce. The goal is to use the same foundation for additional agents such as fulfillment, finance, operations, HR, internal copilots, or other domain-specific assistants.
 
@@ -14,7 +14,7 @@ The repository is organized around two layers:
 Shared infrastructure currently includes:
 
 - LLM provider strategy implementations
-- telemetry abstractions and integrations
+- observability abstractions and integrations
 - package-level conventions for agent modules and tool registration
 
 Each agent package can define its own:
@@ -29,8 +29,8 @@ Each agent package can define its own:
 
 - `src/llm/providers.py`: LLM provider strategy implementations and provider factory
 - `src/llm/__init__.py`: shared LLM exports
-- `src/telemetry/base.py`: telemetry abstraction
-- `src/telemetry/traceloop_logger.py`: TraceLoop telemetry implementation
+- `src/observability/base.py`: observability abstraction
+- `src/observability/traceloop_logger.py`: TraceLoop observability implementation
 - `src/agents/`: home for all domain-specific agents
 - `src/agents/ecommerce/registry.py`: registry for ecommerce agent modules
 - `src/agents/ecommerce/support/agent.py`: ecommerce support agent implementation
@@ -72,7 +72,7 @@ src/
       agent.py
       tools.py
       types.py
-  telemetry/
+  observability/
     base.py
     traceloop_logger.py
 ```
@@ -86,7 +86,7 @@ The current project structure is a good starting point, with a few important not
 What is already correct:
 
 - shared LLM code is outside agent packages
-- shared telemetry code is outside agent packages
+- shared observability code is outside agent packages
 - agent-specific tools and types live with the agent that owns them
 - `src/agents` is the right top-level location for multiple domain agents
 
@@ -212,9 +212,9 @@ Example:
 
 Implement a new provider class in `src/llm/providers.py` and register it in `PROVIDERS`.
 
-### Add a new telemetry provider
+### Add a new observability provider
 
-Implement the `TelemetryLogger` interface from `src/telemetry/base.py` and instantiate that strategy in the agent.
+Implement the `TelemetryLogger` interface from `src/observability/base.py` and instantiate that strategy in the agent.
 
 ### Add a new business tool
 

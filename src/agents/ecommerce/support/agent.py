@@ -6,7 +6,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langgraph.graph import StateGraph
 
 from src.llm import get_llm
-from src.telemetry.traceloop_logger import TraceLoopLogger
+from src.observability.traceloop_logger import TraceLoopLogger
 
 from .tools import TOOLS
 from .types import AgentState
