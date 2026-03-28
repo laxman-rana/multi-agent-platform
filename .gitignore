@@ -3,6 +3,7 @@
 venv/
 env/
 ENV/
+pyvenv.cfg
 .env
 .env.local
 *.venv
