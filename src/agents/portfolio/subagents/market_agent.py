@@ -1,7 +1,10 @@
+import logging
+
 from src.agents.portfolio.state import PortfolioState
 from src.agents.portfolio.tools.market_tools import get_stock_data
 from src.observability import get_telemetry_logger
 
+logger = logging.getLogger(__name__)
 
 # Tickers with volatility above this value trigger the NewsAgent branch
 VOLATILITY_THRESHOLD = 0.30
@@ -40,8 +43,10 @@ class MarketAgent:
         state.stock_insights = insights
 
         high_vol = [t for t, d in insights.items() if d["volatility"] > VOLATILITY_THRESHOLD]
-        print(
-            f"  Fetched data for {len(insights)} tickers."
-            f" High-volatility (>{VOLATILITY_THRESHOLD:.0%}): {high_vol or ['none']}"
+        logger.info(
+            "[MarketAgent] Fetched data for %d tickers | High-volatility (>%s): %s",
+            len(insights),
+            f"{VOLATILITY_THRESHOLD:.0%}",
+            high_vol or ["none"],
         )
         return state

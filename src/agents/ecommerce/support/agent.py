@@ -1,5 +1,6 @@
 import json
 import argparse
+import logging
 from functools import lru_cache
 
 from langchain_core.callbacks import StreamingStdOutCallbackHandler
@@ -11,6 +12,8 @@ from src.observability import get_telemetry_logger
 
 from .tools import TOOLS
 from .types import AgentState
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
@@ -118,7 +121,7 @@ def invoke_model(state: AgentState) -> AgentState:
             break
 
         for tool_call in ai_msg.tool_calls:
-            print(f"AI called tool: {tool_call['name']}")
+            logger.info("[EcommerceAgent] Tool called: %s | args: %s", tool_call["name"], tool_call["args"])
             tool_calls_count += 1
 
             tool_func = next(tool for tool in TOOLS if tool.name == tool_call["name"])
@@ -157,6 +160,12 @@ def construct_graph():
 
 
 def main(clear_cache: bool = False):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-5s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     if clear_cache:
         clear_cached_dependencies()
 
@@ -219,9 +228,9 @@ def main(clear_cache: bool = False):
     ]
 
     for idx, scenario in enumerate(scenarios, start=1):
-        print("\n" + "=" * 80)
-        print(f"Scenario {idx}: {scenario['name']}")
-        print("=" * 80)
+        logger.info("=" * 60)
+        logger.info("Scenario %d: %s", idx, scenario["name"])
+        logger.info("=" * 60)
 
         result = graph.invoke(
             {
@@ -231,7 +240,7 @@ def main(clear_cache: bool = False):
         )
 
         for message in result["messages"]:
-            print(f"{message.type}: {message.content}")
+            logger.info("%s: %s", message.type, message.content)
 
 
 if __name__ == "__main__":

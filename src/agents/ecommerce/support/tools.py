@@ -1,5 +1,9 @@
+import logging
+
 from langchain.tools import tool
 from traceloop.sdk.decorators import workflow
+
+logger = logging.getLogger(__name__)
 
 
 @tool
@@ -7,7 +11,7 @@ from traceloop.sdk.decorators import workflow
 def send_customer_message(order_id: str, text: str) -> str:
     """Send a plain response to the customer."""
 
-    print(f"[TOOL] send_customer_message(order_id={order_id}) -> {text}")
+    logger.info("[Tool] send_customer_message | order_id=%s | text=%s", order_id, text)
     return "sent"
 
 
@@ -16,7 +20,7 @@ def send_customer_message(order_id: str, text: str) -> str:
 def issue_refund(order_id: str, amount: float) -> str:
     """Issue a refund for the given order."""
 
-    print(f"[TOOL] issue_refund(order_id={order_id}, amount={amount})")
+    logger.info("[Tool] issue_refund | order_id=%s | amount=%s", order_id, amount)
     return "refund_queued"
 
 
@@ -25,7 +29,7 @@ def issue_refund(order_id: str, amount: float) -> str:
 def cancel_order(order_id: str) -> str:
     """Cancel an order that hasn't shipped."""
 
-    print(f"[TOOL] cancel_order(order_id={order_id})")
+    logger.info("[Tool] cancel_order | order_id=%s", order_id)
     return "cancelled"
 
 
@@ -34,7 +38,7 @@ def cancel_order(order_id: str) -> str:
 def update_address_for_order(order_id: str, shipping_address: dict) -> str:
     """Change the shipping address for a pending order."""
 
-    print(f"[TOOL] update_address_for_order(order_id={order_id}, address={shipping_address})")
+    logger.info("[Tool] update_address_for_order | order_id=%s | address=%s", order_id, shipping_address)
     return "address_updated"
 
 

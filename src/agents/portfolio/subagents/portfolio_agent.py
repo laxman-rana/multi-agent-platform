@@ -1,5 +1,9 @@
+import logging
+
 from src.agents.portfolio.state import PortfolioState
 from src.agents.portfolio.tools.portfolio_tools import get_portfolio
+
+logger = logging.getLogger(__name__)
 
 
 class PortfolioAgent:
@@ -12,9 +16,10 @@ class PortfolioAgent:
         data = get_portfolio()
         state.user_profile = data["user_profile"]
         state.portfolio = data["positions"]
-        print(
-            f"  Loaded {len(state.portfolio)} positions "
-            f"for {state.user_profile['name']} "
-            f"(risk: {state.user_profile['risk_tolerance']})"
+        logger.info(
+            "[PortfolioAgent] Loaded %d positions for %s (risk: %s)",
+            len(state.portfolio),
+            state.user_profile["name"],
+            state.user_profile["risk_tolerance"],
         )
         return state

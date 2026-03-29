@@ -1,16 +1,70 @@
 import json
+import logging
 import os
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
-from langchain_core.callbacks import StreamingStdOutCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from src.agents.portfolio.state import PortfolioState
 from src.agents.portfolio.tools.validation import validate_decision
+from src.agents.portfolio.tools.scoring import score_stock
+from src.agents.portfolio.tools.rebalance_tools import compute_portfolio_action
 from src.observability import get_telemetry_logger
 from src.llm import get_llm
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_horizon_years(horizon_str: str) -> float:
+    """Parse '5 years', '18 months', etc. to a float number of years."""
+    m = re.search(r'(\d+(?:\.\d+)?)\s*(year|month)', horizon_str.lower())
+    if not m:
+        return 1.0
+    value = float(m.group(1))
+    return value if m.group(2).startswith('year') else value / 12.0
+
+
+def _horizon_block(horizon_years: float) -> str:
+    """Return the investment-horizon awareness section for the system prompt."""
+    if horizon_years >= 3.0:
+        return (
+            "--------------------------------------------------\n"
+            "INVESTMENT HORIZON: LONG-TERM\n"
+            "--------------------------------------------------\n"
+            "The investor's horizon is LONG-TERM (3+ years).\n"
+            "Adjust your reasoning accordingly:\n\n"
+            "  - Daily price moves are NOISE at this timescale.\n"
+            "    Do NOT exit solely because of one red session.\n"
+            "    The quantitative score already excludes the daily-change signal.\n"
+            "  - Focus on: PE valuation trend (forward vs trailing), earnings\n"
+            "    growth, 52-week range position, and long-term thesis integrity.\n"
+            "  - HOLD is strongly preferred when fundamentals are intact.\n"
+            "  - Only EXIT if: thesis is fundamentally broken, extreme overvaluation\n"
+            "    with no earnings growth, or unrealised loss exceeds -35%.\n"
+            "--------------------------------------------------"
+        )
+    if horizon_years >= 1.5:
+        return (
+            "--------------------------------------------------\n"
+            "INVESTMENT HORIZON: MEDIUM-TERM\n"
+            "--------------------------------------------------\n"
+            "The investor's horizon is MEDIUM-TERM (1-3 years).\n"
+            "Balance near-term momentum signals with fundamental indicators.\n"
+            "Avoid reacting to a single session's move in isolation.\n"
+            "--------------------------------------------------"
+        )
+    return (
+        "--------------------------------------------------\n"
+        "INVESTMENT HORIZON: SHORT-TERM\n"
+        "--------------------------------------------------\n"
+        "The investor's horizon is SHORT-TERM (< 1 year).\n"
+        "Daily price momentum and near-term signals carry higher relevance.\n"
+        "--------------------------------------------------"
+    )
 
 
 _SYSTEM_PROMPT = """
@@ -34,19 +88,33 @@ OUTPUT FORMAT (STRICT)
 Return ONLY a valid JSON object. No extra text.
 
 {
-  "action": "EXIT" | "HOLD" | "DOUBLE_DOWN",
+  "action": "EXIT" | "REDUCE" | "HOLD" | "DOUBLE_DOWN",
   "confidence": "high" | "moderate" | "low",
-  "reason": "one concise sentence"
+  "reason": "one concise sentence",
+  "allocation_change": "+10%" | "-15%" | "0%" | "-100%"
 }
+
+allocation_change must be a signed percentage string.
+Rules by action (see ALLOCATION CHANGE RULES below for full guidance):
+  EXIT        → always "-100%"
+  REDUCE      → negative value between "-5%" and "-50%"
+  HOLD        → always "0%"
+  DOUBLE_DOWN → positive value between "+5%" and "+20%"
 
 --------------------------------------------------
 DECISION GUIDELINES
 --------------------------------------------------
 
 EXIT:
-- Significant downside risk
-- High volatility with negative signals
-- Weak fundamentals or negative sentiment
+- Thesis is fundamentally broken
+- Severe downside risk with no recovery path
+- Very high volatility + major negative signals + deep loss
+
+REDUCE:
+- Meaningful downside risk but position still has long-term merit
+- Score is sell/weak-sell AND position weight is significant (>10%)
+- Use instead of EXIT when: small loss (<15%), earnings growth intact, or
+  high sector concentration (trim to rebalance, not abandon)
 
 HOLD:
 - Balanced risk/reward
@@ -81,7 +149,180 @@ RULES
 - Keep reasoning factual and based on input only
 - Reason must reference key factors (risk, fundamentals, sentiment)
 
+--------------------------------------------------
+QUANTITATIVE SCORE RULES
+--------------------------------------------------
+
+You will receive a QUANTITATIVE SCORE block computed deterministically from
+the raw data BEFORE you read it.  Use it as your primary anchor:
+
+  strong_buy  (≥3)  → lean toward DOUBLE_DOWN unless sentiment is very negative
+  buy         (+2)    → lean toward HOLD or DOUBLE_DOWN
+  buy         (+1)    → HOLD only — weak signal, insufficient conviction for DOUBLE_DOWN
+  neutral     (0)     → lean toward HOLD
+  sell        (-1/-2) → lean toward REDUCE (partial trim) before considering EXIT
+  strong_sell (≤-3)  → lean toward EXIT; use REDUCE if long-term thesis intact
+
+DOUBLE_DOWN MINIMUM THRESHOLD:
+  DOUBLE_DOWN requires score >= 2.  A score of +1 is a weak buy signal and does
+  NOT justify adding to the position.  Use HOLD instead.
+
+--------------------------------------------------
+ALLOCATION CHANGE RULES
+--------------------------------------------------
+
+Pick allocation_change that reflects the magnitude of conviction:
+
+  EXIT        → "-100%"  (close the full position — no partial)
+
+  REDUCE      → how much to trim:
+    score -1 AND gain > -5%                  → "-10%"
+    score -1 AND gain in (-15%, -5%]         → "-15%"
+    score -2                                  → "-20%"
+    score ≤ -3 OR position weight > 20%       → "-30%" to "-50%"
+
+  HOLD        → "0%"  (no change)
+
+  DOUBLE_DOWN → how much to add:
+    score +2                                  → "+5%"
+    score +3                                  → "+10%"
+    score ≥ 4                                 → "+15%"
+
+  Adjust upward/downward if sentiment strongly confirms or contradicts the
+  score signal.  Stay within the bounds shown above.
+
+REDUCE vs EXIT guidance:
+  - REDUCE when: score is sell AND (gain_pct > -15% OR fwd_pe improving)
+  - EXIT   when: score is sell AND (gain_pct < -20% OR thesis broken)
+
+You may deviate from the score tier IF you cite a specific reason from the
+sentiment or portfolio context that overrides it.  You MUST mention the score
+tier in your reason field.
+
+--------------------------------------------------
+QUANTITATIVE SCORE RULES
+--------------------------------------------------
+
+You will receive a QUANTITATIVE SCORE block computed deterministically from
+the raw data BEFORE you read it.  Use it as your primary anchor:
+
+  strong_buy  (≥3)  → lean toward DOUBLE_DOWN unless sentiment is very negative
+  buy         (+2)    → lean toward HOLD or DOUBLE_DOWN
+  buy         (+1)    → HOLD only — insufficient conviction for DOUBLE_DOWN
+  neutral     (0)     → lean toward HOLD
+  sell        (-1/-2) → lean toward REDUCE (partial trim) before considering EXIT
+  strong_sell (≤-3)  → lean toward EXIT; use REDUCE if long-term thesis intact
+
+REDUCE vs EXIT guidance:
+  - REDUCE when: score is sell AND (gain_pct > -15% OR fwd_pe improving)
+  - EXIT   when: score is sell AND (gain_pct < -20% OR thesis broken)
+
+You may deviate from the score tier IF you cite a specific reason from the
+sentiment or portfolio context that overrides it.  You MUST mention the score
+tier in your reason field.
+
 """
+
+
+def _build_system_prompt(
+    critic_issues: Optional[List[str]] = None,
+    horizon_years: float = 1.0,
+) -> str:
+    """
+    Returns the base system prompt with a horizon-awareness section appended,
+    or — on a critic retry — prepends a MANDATORY CORRECTION block so the
+    model sees the rejection reason as the very first thing it reads.
+    """
+    base = _SYSTEM_PROMPT + "\n" + _horizon_block(horizon_years) + "\n"
+
+    if not critic_issues:
+        return base
+
+    issues_text = "\n".join(f"  - {issue}" for issue in critic_issues)
+    correction_header = (
+        "=" * 58 + "\n"
+        "\u26a0  MANDATORY CORRECTION — PREVIOUS RESPONSE REJECTED\n"
+        "=" * 58 + "\n"
+        "Your previous response was rejected by the critic.\n"
+        "Fix the issues raised by the critic:\n"
+        f"{issues_text}\n\n"
+        "Rules that apply to THIS retry:\n"
+        "  1. You MUST resolve every issue listed above.\n"
+        "  2. A 'low' confidence answer will be rejected again automatically.\n"
+        "  3. If data is truly insufficient, output HOLD with 'moderate' confidence\n"
+        "     and explain what data is missing in the reason.\n"
+        "=" * 58 + "\n\n"
+    )
+    return correction_header + base.lstrip()
+
+
+def _format_quant_score(quant_score: Dict[str, Any]) -> str:
+    """
+    Renders the deterministic score block injected into every human message.
+    The model sees the score BEFORE the free-form data so it acts as an anchor.
+    """
+    score   = quant_score["score"]
+    tier    = quant_score["tier"].upper().replace("_", " ")
+    sign    = "+" if score > 0 else ""
+    lines   = quant_score["breakdown"]
+    body    = "\n".join(lines) if lines else "  (no signals fired)"
+    note    = (
+        "  Note: daily session change excluded — long-term investor horizon\n"
+        if quant_score.get("long_term")
+        else ""
+    )
+    return (
+        "--------------------------------------------------\n"
+        "QUANTITATIVE SCORE (deterministic — computed before LLM)\n"
+        "--------------------------------------------------\n"
+        f"  Total score : {sign}{score}  \u2192  {tier}\n"
+        f"  Signals:\n{body}\n"
+        f"{note}"
+        "--------------------------------------------------"
+    )
+
+
+def _format_portfolio_context(portfolio_context: Dict[str, Any]) -> str:
+    """
+    Renders the portfolio-level context block that appears in every human
+    message so the LLM can factor portfolio-wide risk into each decision.
+    """
+    sector_lines = "\n".join(
+        f"    {sector:<22} {pct:.1f}%"
+        for sector, pct in sorted(
+            portfolio_context.get("sector_exposure", {}).items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+    )
+    top_stock    = portfolio_context.get("top_stock", "")
+    top_weight   = portfolio_context.get("top_stock_weight", 0.0)
+    conc_risk    = portfolio_context.get("concentration_risk", "unknown").upper()
+    high_conc    = portfolio_context.get("high_concentration", False)
+    n_positions  = portfolio_context.get("total_positions", 0)
+
+    conc_warning = ""
+    if high_conc:
+        conc_warning = (
+            f"\n  \u26a0 HIGHLY CONCENTRATED: {top_stock} makes up {top_weight:.1f}% of the "
+            f"portfolio.\n    Be conservative with DOUBLE_DOWN for this ticker or its sector."
+        )
+
+    horizon_str  = portfolio_context.get("investment_horizon", "")
+    horizon_line = f"  Investment horizon : {horizon_str}\n" if horizon_str else ""
+
+    return (
+        "--------------------------------------------------\n"
+        "PORTFOLIO CONTEXT (consider this, not just the stock)\n"
+        "--------------------------------------------------\n"
+        f"  Concentration risk : {conc_risk}\n"
+        f"  Total positions    : {n_positions}\n"
+        f"  Top holding        : {top_stock} ({top_weight:.1f}% of portfolio)\n"
+        f"{horizon_line}"
+        f"  Sector exposure    :\n{sector_lines}\n"
+        f"{conc_warning}\n"
+        "--------------------------------------------------"
+    )
 
 
 def _build_human_message(
@@ -90,12 +331,9 @@ def _build_human_message(
     news: List[Dict[str, str]],
     gain_pct: float,
     stock_allocation_pct: Optional[float] = None,
-    critic_issues: Optional[List[str]] = None,
+    portfolio_context: Optional[Dict[str, Any]] = None,
+    quant_score: Optional[Dict[str, Any]] = None,
 ) -> str:
-    news_lines = "\n".join(
-        f"  - [{n.get('sentiment', 'neutral').upper()}] {n['headline']}" for n in news
-    ) or "  (no recent news)"
-
     pe_trailing = insight.get('pe_ratio')
     pe_forward  = insight.get('forward_pe')
     pe_trailing_str = f"{pe_trailing:.1f}" if pe_trailing is not None else "N/A"
@@ -107,18 +345,20 @@ def _build_human_message(
     else:
         weight_line = ""
 
-    critic_block = ""
-    if critic_issues:
-        formatted = "\n".join(f"  - {issue}" for issue in critic_issues)
-        critic_block = (
-            f"\n--------------------------------------------------\n"
-            f"PREVIOUS ATTEMPT REJECTED BY CRITIC:\n"
-            f"{formatted}\n"
-            f"Address ALL of the above issues in your new response.\n"
-            f"--------------------------------------------------\n"
-        )
+    portfolio_block = (
+        "\n" + _format_portfolio_context(portfolio_context) + "\n"
+        if portfolio_context
+        else ""
+    )
+
+    score_block = (
+        "\n" + _format_quant_score(quant_score) + "\n"
+        if quant_score
+        else ""
+    )
 
     return (
+        f"{score_block}"
         f"Ticker        : {ticker}\n"
         f"Current price : ${insight['price']:.2f}\n"
         f"Average cost  : ${insight['avg_cost']:.2f}\n"
@@ -129,9 +369,17 @@ def _build_human_message(
         f"Forward P/E   : {pe_forward_str}\n"
         f"52w high/low  : ${insight.get('52w_high', 0):.2f} / ${insight.get('52w_low', 0):.2f}\n"
         f"{weight_line}"
-        f"\nRecent news:\n{news_lines}\n"
-        f"{critic_block}\n"
-        "What is your recommendation? Respond with JSON only."
+        f"{portfolio_block}"
+        + (
+            f"\nRecent news:\n"
+            + "\n".join(
+                f"  - [{n.get('sentiment', 'neutral').upper()}] {n['headline']}" for n in news
+            )
+            + "\n\n"
+            if news
+            else "\n"
+        )
+        + "What is your recommendation? Respond with JSON only."
     )
 
 
@@ -141,9 +389,14 @@ def _get_decision_llm():
     Lazy singleton for the decision LLM.
     Override the provider with the PORTFOLIO_LLM_PROVIDER env var.
     Supported values: ollama (default), openai, google.
+
+    StreamingStdOutCallbackHandler is intentionally excluded: with parallel
+    execution (ThreadPoolExecutor) multiple threads fire token callbacks
+    simultaneously, interleaving tokens on stdout and producing garbled output.
+    All response content is logged via telemetry after each call completes.
     """
     model = os.getenv("PORTFOLIO_LLM_PROVIDER", "ollama")
-    return get_llm(model_name=model, callbacks=[StreamingStdOutCallbackHandler()])
+    return get_llm(model_name=model)
 
 
 def _parse_llm_response(content: str, gain_pct: float) -> Dict[str, Any]:
@@ -155,14 +408,96 @@ def _parse_llm_response(content: str, gain_pct: float) -> Dict[str, Any]:
         text = parts[1].lstrip("json").strip() if len(parts) > 1 else text
     parsed = json.loads(text)
     action = parsed["action"].upper()
-    if action not in ("EXIT", "HOLD", "DOUBLE_DOWN"):
+    if action not in ("EXIT", "HOLD", "DOUBLE_DOWN", "REDUCE"):
         raise ValueError(f"Unexpected action value: {action!r}")
+    allocation_change = str(parsed.get("allocation_change", "0%")).strip()
     return {
         "action": action,
         "confidence": parsed["confidence"].lower(),
         "reason": parsed["reason"],
         "gain_pct": round(gain_pct, 2),
+        "allocation_change": allocation_change,
     }
+
+
+def _apply_action_floor(result: Dict[str, Any], quant_score: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Enforce minimum score thresholds for aggressive actions.
+
+    DOUBLE_DOWN requires score >= 2.  A score of +1 is a weak buy — the LLM
+    sometimes promotes it to DOUBLE_DOWN anyway.  Downgrade to HOLD.
+    """
+    score = quant_score.get("score")
+    if score is None:
+        return result
+    if result["action"] == "DOUBLE_DOWN" and score < 2:
+        result["action"] = "HOLD"
+        result["allocation_change"] = "0%"
+        result["reason"] = (
+            f"[Downgraded from DOUBLE_DOWN: score={score} < 2 threshold] "
+            + result["reason"]
+        )
+    return result
+
+
+def _apply_allocation_change(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Enforce deterministic allocation bounds post-parse.
+
+    - EXIT  → always "-100%" (LLM must not partial-exit)
+    - HOLD  → always "0%"
+    - REDUCE / DOUBLE_DOWN → clamp to safe ranges to prevent extreme LLM output
+    """
+    action = result["action"]
+    if action == "EXIT":
+        result["allocation_change"] = "-100%"
+        return result
+    if action == "HOLD":
+        result["allocation_change"] = "0%"
+        return result
+
+    raw = result.get("allocation_change", "0%")
+    # Parse the numeric part (strip leading sign and trailing %)
+    try:
+        numeric = float(raw.replace("%", "").replace("+", ""))
+    except ValueError:
+        numeric = 0.0
+
+    if action == "REDUCE":
+        # Must be negative; clamp to [-50, -5]
+        numeric = max(-50.0, min(-5.0, -abs(numeric)))
+    elif action == "DOUBLE_DOWN":
+        # Must be positive; clamp to [+5, +20]
+        numeric = max(5.0, min(20.0, abs(numeric)))
+
+    sign = "+" if numeric > 0 else ""
+    result["allocation_change"] = f"{sign}{numeric:.0f}%"
+    return result
+
+
+def _apply_score_confidence(result: Dict[str, Any], quant_score: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Override LLM-reported confidence with a deterministic rule based on the
+    absolute value of the quantitative score.
+
+    LLMs tend to report "high" confidence far too often regardless of signal
+    strength.  Anchoring to the score magnitude produces more calibrated output:
+
+      abs(score) == 0       → moderate  (neutral signal, LLM is speculating)
+      abs(score) == 1       → moderate  (weak signal — one factor tipped the scale)
+      abs(score) >= 2       → high      (multiple signals align)
+
+    The LLM confidence is only preserved when no quant score is available.
+    """
+    score = quant_score.get("score")
+    if score is None:
+        return result
+    abs_score = abs(score)
+    if abs_score >= 2:
+        result["confidence"] = "high"
+    else:
+        result["confidence"] = "moderate"
+    return result
 
 
 
@@ -181,15 +516,33 @@ class DecisionAgent:
         is_retry = state.critic_retry_count > 0
         stock_allocation: Dict[str, float] = state.risk_metrics.get("stock_allocation", {})
 
+        # Parse investment horizon once — used for scoring and prompt tuning.
+        horizon_str   = state.user_profile.get("investment_horizon", "1 year")
+        horizon_years = _parse_horizon_years(horizon_str)
+
+        # Build the portfolio-level context once — shared across all per-ticker decisions.
+        portfolio_context: Dict[str, Any] = {
+            "high_concentration":  state.risk_metrics.get("high_concentration", False),
+            "top_stock":           state.risk_metrics.get("top_stock", ""),
+            "top_stock_weight":    stock_allocation.get(state.risk_metrics.get("top_stock", ""), 0.0),
+            "concentration_risk":  state.risk_metrics.get("concentration_risk", "unknown"),
+            "sector_exposure":     state.sector_allocation,
+            "total_positions":     len(state.portfolio),
+            "investment_horizon":  horizon_str,
+        }
+
         if is_retry:
-            print(
-                f"  [DecisionAgent] Retry #{state.critic_retry_count} after critic rejection"
+            logger.info(
+                "[DecisionAgent] Retry #%d after critic rejection",
+                state.critic_retry_count,
             )
 
+        # ── build per-ticker args list ────────────────────────────────────
+        ticker_args: List[Tuple] = []
         for ticker, insight in state.stock_insights.items():
-            news = state.news.get(ticker, [])
-            gain_pct = ((insight["price"] - insight["avg_cost"]) / insight["avg_cost"]) * 100
-
+            news        = state.news.get(ticker, [])
+            gain_pct    = ((insight["price"] - insight["avg_cost"]) / insight["avg_cost"]) * 100
+            quant_score = score_stock(insight, gain_pct, horizon_years=horizon_years)
             allocation_pct = stock_allocation.get(ticker)
             per_ticker_feedback = state.critic_feedback.get("per_ticker", {})
             critic_issues: Optional[List[str]] = (
@@ -197,30 +550,72 @@ class DecisionAgent:
                 if is_retry
                 else None
             )
+            ticker_args.append((
+                ticker, insight, news, gain_pct, allocation_pct,
+                critic_issues or [], portfolio_context, quant_score,
+                horizon_years,
+            ))
 
-            decision = self._decide(
-                ticker, insight, news, gain_pct, allocation_pct, critic_issues
-            )
-            decisions[ticker] = decision
+        # ── parallel LLM calls ────────────────────────────────────────────
+        decisions: dict = {}
+        quant_scores: dict = {t[0]: t[7] for t in ticker_args}  # ticker → quant_score
+
+        def _call(args: Tuple) -> Tuple[str, Dict[str, Any]]:
+            tkr, ins, nws, gpct, alloc, issues, pctx, qscore, hyrs = args
+            return tkr, self._decide(tkr, ins, nws, gpct, alloc, issues, pctx, qscore, horizon_years=hyrs)
+
+        with ThreadPoolExecutor(max_workers=len(ticker_args) or 1) as pool:
+            futures = {pool.submit(_call, args): args[0] for args in ticker_args}
+            for future in as_completed(futures):
+                ticker, decision = future.result()  # propagates exceptions
+                decisions[ticker] = decision
+
+        # ── telemetry + logging (sequential, after all futures done) ──────
+        for ticker, decision in decisions.items():
+            quant_score    = quant_scores[ticker]
+            allocation_pct = stock_allocation.get(ticker)
+            alloc_note     = f" weight={allocation_pct:.1f}%" if allocation_pct is not None else ""
             telemetry.log_event(
                 "decision_made",
                 {
-                    "ticker": ticker,
-                    "action": decision["action"],
-                    "confidence": decision["confidence"],
-                    "gain_pct": decision["gain_pct"],
-                    "news_count": len(news),
-                    "retry": is_retry,
+                    "ticker":      ticker,
+                    "action":      decision["action"],
+                    "confidence":  decision["confidence"],
+                    "gain_pct":    decision["gain_pct"],
+                    "news_count":  len(state.news.get(ticker, [])),
+                    "retry":       is_retry,
+                    "quant_score": quant_score["score"],
+                    "quant_tier":  quant_score["tier"],
                 },
             )
-            alloc_note = f" weight={allocation_pct:.1f}%" if allocation_pct is not None else ""
-            print(
-                f"  [DecisionAgent] {ticker}: {decision['action']:<13} "
-                f"[{decision['confidence'].upper()}]  "
-                f"gain: {decision['gain_pct']:+.1f}%{alloc_note}"
+            logger.info(
+                "[DecisionAgent] %s: %-13s [%s]  gain: %+.1f%%  score: %+d (%s)%s",
+                ticker,
+                decision["action"],
+                decision["confidence"].upper(),
+                decision["gain_pct"],
+                quant_score["score"],
+                quant_score["tier"],
+                alloc_note,
             )
 
         state.decisions = decisions
+
+        portfolio_action = compute_portfolio_action(
+            sector_allocation=state.sector_allocation,
+            decisions=decisions,
+            risk_metrics=state.risk_metrics,
+            portfolio=state.portfolio,
+        )
+        state.portfolio_action = portfolio_action
+        if portfolio_action.get("rebalance"):
+            logger.info(
+                "[DecisionAgent] Portfolio action: REBALANCE | %s %.1f%% → %s | Priority exits: %s",
+                portfolio_action["reduce_sector"],
+                portfolio_action["current_exposure"],
+                portfolio_action["target_exposure"],
+                portfolio_action["priority_exits"] or "none",
+            )
         return state
 
     def _decide(
@@ -231,14 +626,20 @@ class DecisionAgent:
         gain_pct: float,
         stock_allocation_pct: Optional[float] = None,
         critic_issues: Optional[List[str]] = None,
+        portfolio_context: Optional[Dict[str, Any]] = None,
+        quant_score: Optional[Dict[str, Any]] = None,
+        horizon_years: float = 1.0,
     ) -> Dict[str, Any]:
         telemetry = get_telemetry_logger()
         human_msg = _build_human_message(
-            ticker, insight, news, gain_pct, stock_allocation_pct, critic_issues
+            ticker, insight, news, gain_pct, stock_allocation_pct, portfolio_context, quant_score
         )
+        # On a critic retry the system prompt leads with the rejection reasons
+        # so the model sees them as the highest-priority instruction.
+        system_prompt = _build_system_prompt(critic_issues or None, horizon_years=horizon_years)
         llm = _get_decision_llm()
         messages = [
-            SystemMessage(content=_SYSTEM_PROMPT),
+            SystemMessage(content=system_prompt),
             HumanMessage(content=human_msg),
         ]
 
@@ -251,6 +652,9 @@ class DecisionAgent:
             )
             try:
                 result = _parse_llm_response(response.content, gain_pct)
+                result = _apply_action_floor(result, quant_score or {})
+                result = _apply_allocation_change(result)
+                result = _apply_score_confidence(result, quant_score or {})
                 valid, val_err = validate_decision(result)
                 if not valid:
                     raise ValueError(val_err)

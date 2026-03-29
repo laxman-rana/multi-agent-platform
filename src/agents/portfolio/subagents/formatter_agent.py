@@ -1,7 +1,10 @@
+import logging
+
 from src.agents.portfolio.state import PortfolioState
 
+logger = logging.getLogger(__name__)
 
-_ACTION_ICON = {"EXIT": "🔴", "HOLD": "🟡", "DOUBLE_DOWN": "🟢"}
+_ACTION_ICON = {"EXIT": "🔴", "REDUCE": "🟠", "HOLD": "🟡", "DOUBLE_DOWN": "🟢"}
 _SENTIMENT_ICON = {"positive": "↑", "negative": "↓", "neutral": "→"}
 
 
@@ -15,7 +18,7 @@ class FormatterAgent:
     def run(self, state: PortfolioState) -> PortfolioState:
         lines = self._build_report(state)
         state.final_output = "\n".join(lines)
-        print("  Report generated.")
+        logger.info("[FormatterAgent] Report generated.")
         return state
 
     # ------------------------------------------------------------------
@@ -28,6 +31,7 @@ class FormatterAgent:
         lines += self._summary(state)
         lines += self._sector_section(state)
         lines += self._decisions_section(state)
+        lines += self._portfolio_action_section(state)
         if state.news:
             lines += self._news_section(state)
         lines += self._critic_section(state)
@@ -76,6 +80,7 @@ class FormatterAgent:
             lines.append(
                 f"  {icon}  {ticker:<6}  {decision['action']:<13}"
                 f"[{decision['confidence'].upper()}]  "
+                f"alloc: {decision.get('allocation_change', 'n/a'):>6}  "
                 f"PnL: {decision.get('gain_pct', 0):+.1f}%  "
                 f"@ ${insight.get('price', 0):.2f}"
             )
@@ -84,6 +89,37 @@ class FormatterAgent:
             for issue in issues:
                 lines.append(f"       ⚠  {issue}")
 
+        lines.append("")
+        return lines
+
+    def _portfolio_action_section(self, state: PortfolioState) -> list:
+        pa = state.portfolio_action
+        if not pa:
+            return []
+
+        lines = ["── PORTFOLIO ACTION ────────────────────────────────────────────────"]
+
+        if pa.get("rebalance"):
+            lines.append("  ⚠  REBALANCE RECOMMENDED")
+            lines.append(
+                f"  Reduce sector  : {pa['reduce_sector']} "
+                f"(currently {pa['current_exposure']}% \u2192 target \u2264 {pa['target_exposure']})"
+            )
+            exits = pa.get("priority_exits", [])
+            if exits:
+                lines.append(f"  Priority exits : {', '.join(exits)}  (already flagged for EXIT)")
+        else:
+            lines.append("  \u2705  Sector allocation within acceptable bounds.")
+
+        if pa.get("add_diversification"):
+            missing = pa.get("missing_sectors", [])
+            lines.append(
+                f"  Diversify into : {', '.join(missing)}"
+                if missing
+                else "  Diversify into additional sectors."
+            )
+
+        lines.append(f"  Summary        : {pa.get('summary', '')}")
         lines.append("")
         return lines
 

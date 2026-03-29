@@ -6,10 +6,12 @@ Called after every LLM response to catch malformed or out-of-spec decisions
 before they propagate downstream.
 """
 
+import re
 from typing import Any, Dict, Tuple
 
-_VALID_ACTIONS: frozenset = frozenset({"EXIT", "HOLD", "DOUBLE_DOWN"})
+_VALID_ACTIONS: frozenset = frozenset({"EXIT", "HOLD", "DOUBLE_DOWN", "REDUCE"})
 _VALID_CONFIDENCE: frozenset = frozenset({"high", "moderate", "low"})
+_ALLOCATION_CHANGE_RE = re.compile(r"^[+-]?\d+(\.\d+)?%$")
 
 
 def validate_decision(decision: Dict[str, Any]) -> Tuple[bool, str]:
@@ -41,6 +43,15 @@ def validate_decision(decision: Dict[str, Any]) -> Tuple[bool, str]:
     reason = str(decision.get("reason", "")).strip()
     if not reason:
         return False, "Missing or empty 'reason' field."
+
+    allocation_change = str(decision.get("allocation_change", "")).strip()
+    if not allocation_change:
+        return False, "Missing or empty 'allocation_change' field."
+    if not _ALLOCATION_CHANGE_RE.match(allocation_change):
+        return False, (
+            f"Invalid allocation_change {allocation_change!r}. "
+            "Expected a signed percentage string like '+10%', '-15%', or '0%'."
+        )
 
     return True, ""
 

@@ -1,6 +1,10 @@
+import logging
+
 from src.agents.portfolio.state import PortfolioState
 from src.agents.portfolio.tools.risk_tools import calculate_risk
 from src.observability import get_telemetry_logger
+
+logger = logging.getLogger(__name__)
 
 
 class RiskAgent:
@@ -38,12 +42,14 @@ class RiskAgent:
         )
         stock_alloc = metrics.get("stock_allocation", {})
         top_stock = metrics.get("top_stock", "")
-        print(
-            f"  [RiskAgent] Concentration: {metrics.get('concentration_risk', 'unknown').upper()}"
-            f" | Top sector: {metrics.get('top_sector')}"
-            f" ({metrics.get('sector_allocation', {}).get(metrics.get('top_sector', ''), 0):.1f}%)"
-            f" | Top stock: {top_stock} ({stock_alloc.get(top_stock, 0):.1f}%)"
-            f" | Value: ${metrics.get('total_portfolio_value', 0):,.2f}"
-            f"{conc_note}"
+        logger.info(
+            "[RiskAgent] Concentration: %s | Top sector: %s (%.1f%%) | Top stock: %s (%.1f%%) | Value: $%s%s",
+            metrics.get("concentration_risk", "unknown").upper(),
+            metrics.get("top_sector"),
+            metrics.get("sector_allocation", {}).get(metrics.get("top_sector", ""), 0),
+            top_stock,
+            stock_alloc.get(top_stock, 0),
+            f"{metrics.get('total_portfolio_value', 0):,.2f}",
+            conc_note,
         )
         return state

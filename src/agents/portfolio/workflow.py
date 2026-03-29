@@ -9,6 +9,7 @@ Run from the repository root:
 """
 
 import argparse
+import logging
 import time
 
 from langgraph.graph import StateGraph, END
@@ -23,10 +24,23 @@ from src.agents.portfolio.subagents.decision_agent import DecisionAgent
 from src.agents.portfolio.subagents.critic_agent import CriticAgent
 from src.agents.portfolio.subagents.formatter_agent import FormatterAgent
 
+logger = logging.getLogger(__name__)
+
+
+def _passthrough(state: PortfolioState) -> PortfolioState:
+    """
+    No-op synchronisation node used as a fan-in barrier.
+
+    LangGraph waits for ALL predecessor nodes to complete before invoking
+    this node, so placing it after a parallel fan-out guarantees the state
+    writes from every branch are merged before execution continues.
+    """
+    return state
+
 
 def volatility_router(state: PortfolioState) -> str:
     """
-    Conditional routing function called after MarketAgent.
+    Conditional routing function called after the parallel sync barrier.
 
     Returns "high_volatility" if any ticker's volatility exceeds the
     threshold, otherwise returns "normal". These keys are mapped to
@@ -59,31 +73,69 @@ def critic_router(state: PortfolioState) -> str:
 
 def _increment_retry(state: PortfolioState) -> PortfolioState:
     state.critic_retry_count += 1
-    print(
-        f"  [Graph] Critic loop retry #{state.critic_retry_count}/{_MAX_CRITIC_RETRIES}"
+    logger.info(
+        "[Graph] Critic loop retry #%d/%d",
+        state.critic_retry_count,
+        _MAX_CRITIC_RETRIES,
     )
     return state
+
+
+def _risk_node(state: PortfolioState) -> dict:
+    """
+    Thin adapter so the parallel risk branch only emits the fields it owns.
+
+    LangGraph's LastValue channel raises InvalidUpdateError when two parallel
+    branches both return the full state object — it sees concurrent writes to
+    every field, including ones neither branch touched.  Returning only the
+    written keys avoids the conflict.
+    """
+    updated = RiskAgent().run(state)
+    return {
+        "risk_metrics":     updated.risk_metrics,
+        "sector_allocation": updated.sector_allocation,
+    }
+
+
+def _market_node(state: PortfolioState) -> dict:
+    """Same adapter pattern for the parallel market branch."""
+    updated = MarketAgent().run(state)
+    return {"stock_insights": updated.stock_insights}
 
 
 def build_graph(skip_news: bool = False):
     """
     Assemble and wire the agent graph using LangGraph StateGraph.
 
+    RiskAgent and MarketAgent only read state.portfolio and write to
+    completely separate fields (risk_metrics vs stock_insights), so they
+    run in parallel as a fan-out from PortfolioAgent. A no-op "sync" node
+    acts as the fan-in barrier — LangGraph waits for both branches before
+    proceeding.
+
+    The two parallel nodes register as thin dict-returning wrappers
+    (_risk_node / _market_node) instead of the agent .run() methods directly.
+    This prevents LangGraph's LastValue channel from seeing concurrent writes
+    to shared read-only fields (user_profile, portfolio, etc.).
+
     Default flow (skip_news=False):
-        PortfolioAgent → RiskAgent → MarketAgent
-                                          │
-                           (conditional) ─┤ volatility > 30%  ──► NewsAgent ──┐
-                                          │                                    │
-                                          └─ all within threshold ─────────────┤
-                                                                               ▼
-                                                                        DecisionAgent
-                                                                               │
-                                                                        CriticAgent
-                                                                               │
-                                                                       FormatterAgent
+
+        PortfolioAgent ──┬──► RiskAgent ───────────────────────────────┐
+                         │                                              ▼
+                         └──► MarketAgent ──────────────────────► sync (fan-in)
+                                                                        │
+                                               (conditional) ───────────┤
+                                               volatility > 30%         ├──► NewsAgent ──┐
+                                               all within threshold ─────┤               │
+                                                                         └───────────────┼──► DecisionAgent
+                                                                                         │         │
+                                                                                         │    CriticAgent
+                                                                                         │    (loop ≤2x)
+                                                                                         │         │
+                                                                                         └── FormatterAgent
 
     With --no-news (skip_news=True):
-        PortfolioAgent → RiskAgent → MarketAgent → DecisionAgent → CriticAgent → FormatterAgent
+        PortfolioAgent → [RiskAgent ‖ MarketAgent] → sync → DecisionAgent → CriticAgent → FormatterAgent
     """
     graph = StateGraph(PortfolioState)
 
@@ -91,26 +143,33 @@ def build_graph(skip_news: bool = False):
     # Node names must not collide with PortfolioState field names;
     # "portfolio" and "news" are state fields, so we suffix them with "_agent".
     graph.add_node("portfolio_agent", PortfolioAgent().run)
-    graph.add_node("risk",            RiskAgent().run)
-    graph.add_node("market",          MarketAgent().run)
+    graph.add_node("risk",            _risk_node)
+    graph.add_node("market",          _market_node)
+    graph.add_node("sync",            _passthrough)   # fan-in barrier
     graph.add_node("news_agent",      NewsAgent().run)
     graph.add_node("decision",        DecisionAgent().run)
     graph.add_node("critic",          CriticAgent().run)
     graph.add_node("retry_handler",   _increment_retry)
     graph.add_node("formatter",       FormatterAgent().run)
 
-    # Entry point and linear edges
+    # Fan-out: RiskAgent and MarketAgent run in parallel.
+    # They share only the read-only state.portfolio and write to distinct fields
+    # (risk_metrics/sector_allocation vs stock_insights) — no conflicts.
     graph.set_entry_point("portfolio_agent")
     graph.add_edge("portfolio_agent", "risk")
-    graph.add_edge("risk",            "market")
+    graph.add_edge("portfolio_agent", "market")
+
+    # Fan-in: sync waits for both branches before continuing.
+    graph.add_edge("risk",   "sync")
+    graph.add_edge("market", "sync")
 
     if skip_news:
         # Bypass NewsAgent entirely
-        graph.add_edge("market", "decision")
+        graph.add_edge("sync", "decision")
     else:
-        # Conditional branch after market data is fetched
+        # Conditional branch once both data sources are ready
         graph.add_conditional_edges(
-            "market",
+            "sync",
             volatility_router,
             {
                 "high_volatility": "news_agent",
@@ -135,11 +194,16 @@ def build_graph(skip_news: bool = False):
 
 
 def main(skip_news: bool = False) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-5s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
     telemetry = get_telemetry_logger()
 
-    print("\n" + "=" * 70)
-    print("  STARTING PORTFOLIO ANALYSIS WORKFLOW")
-    print("=" * 70)
+    logger.info("=" * 60)
+    logger.info("STARTING PORTFOLIO ANALYSIS WORKFLOW")
+    logger.info("=" * 60)
 
     telemetry.log_event("workflow_start", {"skip_news": skip_news})
     start = time.monotonic()
@@ -162,6 +226,7 @@ def main(skip_news: bool = False) -> None:
         },
     )
 
+    logger.info("Workflow completed in %.2fs", elapsed)
     print("\n" + final_state.final_output)
 
 

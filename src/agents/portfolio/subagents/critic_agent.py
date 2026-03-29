@@ -1,7 +1,10 @@
+import logging
 from typing import Any, Dict
 
 from src.agents.portfolio.state import PortfolioState
 from src.observability import get_telemetry_logger
+
+logger = logging.getLogger(__name__)
 
 
 # Flag if more than this fraction of positions are EXIT recommendations
@@ -34,13 +37,13 @@ class CriticAgent:
             "feedback": "",
         }
 
-        # Portfolio-level check: too many exits at once
-        exit_count = sum(1 for d in decisions.values() if d["action"] == "EXIT")
+        # Portfolio-level check: too many exits/reduces at once
+        exit_count = sum(1 for d in decisions.values() if d["action"] in ("EXIT", "REDUCE"))
         exit_rate = exit_count / len(decisions) if decisions else 0
 
         if exit_rate > _MAX_EXIT_RATE:
             feedback["warnings"].append(
-                f"High exit rate ({exit_rate:.0%}) across portfolio. "
+                f"High exit/reduce rate ({exit_rate:.0%}) across portfolio. "
                 f"Verify this aligns with your long-term strategy before acting."
             )
 
@@ -87,15 +90,16 @@ class CriticAgent:
         )
 
         if not feedback["approved"]:
-            print(
-                f"  [CriticAgent] REJECTED — retry will be triggered | "
-                f"Flagged: {flagged} | Feedback: {feedback['feedback']}"
+            logger.info(
+                "[CriticAgent] REJECTED — retry will be triggered | Flagged: %s | Feedback: %s",
+                flagged,
+                feedback["feedback"],
             )
         else:
-            print(
-                f"  [CriticAgent] APPROVED | "
-                f"Warnings: {len(feedback['warnings'])} | "
-                f"Flagged tickers: {len(flagged)}"
+            logger.info(
+                "[CriticAgent] APPROVED | Warnings: %d | Flagged tickers: %d",
+                len(feedback["warnings"]),
+                len(flagged),
             )
 
         state.critic_feedback = feedback
