@@ -1,8 +1,13 @@
 # Agents Project
 
-This repository is intended to host multiple AI agents across different business domains. It provides a shared Python package layout for agent implementations, LLM providers, observability integrations, and agent-specific tools.
+This repository hosts multiple AI agents across different business domains. It provides a shared Python package layout for agent implementations, LLM providers, observability integrations, and agent-specific tools.
 
-The current implemented example is an e-commerce customer-support agent, but the repository is not limited to e-commerce. The goal is to use the same foundation for additional agents such as fulfillment, finance, operations, HR, internal copilots, or other domain-specific assistants.
+Two agents are currently implemented:
+
+- **E-commerce support agent** — LangGraph-based customer support workflow with tool-calling (refunds, messaging)
+- **Portfolio analysis agent** — LangGraph multi-agent pipeline that analyses an investor's equity portfolio using live market data (yfinance) and an LLM to produce hold/exit/double-down recommendations
+
+The goal is to use the same shared foundation for additional agents such as fulfillment, finance, operations, HR, or other domain-specific assistants.
 
 ## Project Overview
 
@@ -27,90 +32,42 @@ Each agent package can define its own:
 
 ## Repository Layout
 
-- `src/llm/providers.py`: LLM provider strategy implementations and provider factory
+- `src/llm/providers.py`: LLM provider strategy and factory (`get_llm()`)
 - `src/llm/__init__.py`: shared LLM exports
+- `src/observability/__init__.py`: shared `get_telemetry_logger()` singleton
 - `src/observability/base.py`: observability abstraction
-- `src/observability/traceloop_logger.py`: TraceLoop observability implementation
-- `src/agents/`: home for all domain-specific agents
-- `src/agents/ecommerce/registry.py`: registry for ecommerce agent modules
-- `src/agents/ecommerce/support/agent.py`: ecommerce support agent implementation
-- `src/agents/ecommerce/support/tools.py`: tools for the ecommerce support agent
-- `src/agents/ecommerce/support/types.py`: state types for the ecommerce support agent
-- `src/agents/ecommerce_customer_support/`: backward-compatible shim package for the old path
+- `src/observability/traceloop_logger.py`: TraceLoop implementation
+- `src/agents/ecommerce/support/agent.py`: e-commerce support agent (LangGraph + tool-calling)
+- `src/agents/ecommerce/support/tools.py`: refund and messaging tools
+- `src/agents/ecommerce/support/types.py`: state types
+- `src/agents/portfolio/workflow.py`: portfolio analysis entry point (LangGraph `StateGraph`)
+- `src/agents/portfolio/subagents/`: 7 pipeline nodes (portfolio, risk, market, news, decision, critic, formatter)
+- `src/agents/portfolio/tools/`: live data tools (yfinance, VADER) and mock positions
+- `src/agents/portfolio/state/`: `PortfolioState` dataclass
 - `src/requirements.txt`: Python dependencies
 
-## Recommended Structure For Multiple Agents
+## Running the Agents
 
-The current structure is generally correct for a multi-agent repository.
+### E-commerce support agent
 
-Recommended convention:
-
-```text
-src/
-  llm/
-    providers.py
-  agents/
-    ecommerce/
-      registry.py
-      support/
-        agent.py
-        tools.py
-        types.py
-      returns/
-        agent.py
-        tools.py
-        types.py
-      fraud/
-        agent.py
-        tools.py
-        types.py
-    finance/
-      agent.py
-      tools.py
-      types.py
-    hr/
-      agent.py
-      tools.py
-      types.py
-  observability/
-    base.py
-    traceloop_logger.py
+```powershell
+python -m src.agents.ecommerce.support.agent
 ```
 
-This layout works well if each agent remains self-contained and shared concerns stay outside agent folders.
+### Portfolio analysis agent
 
-## Structure Assessment
+```powershell
+# With live news routing (default)
+python -m src.agents.portfolio.workflow
 
-The current project structure is a good starting point, with a few important notes.
+# Skip NewsAgent
+python -m src.agents.portfolio.workflow --no-news
+```
 
-What is already correct:
+Set `PORTFOLIO_LLM_PROVIDER` to `ollama` (default), `openai`, or `google` to
+select the LLM used by `DecisionAgent`.
 
-- shared LLM code is outside agent packages
-- shared observability code is outside agent packages
-- agent-specific tools and types live with the agent that owns them
-- `src/agents` is the right top-level location for multiple domain agents
-
-What should be kept consistent as the repo grows:
-
-- use snake_case folder names for all agent packages
-- keep each agent in its own package under `src/agents`
-- keep shared integrations out of agent-specific directories
-- run agents as Python modules from the repository root
-
-What will likely need improvement later:
-
-- if many agents share common prompting, execution helpers, or graph utilities, add a shared package such as `src/agents/common` instead of duplicating logic
-
-What has already been standardized in this repository:
-
-- shared LLM code now lives under `src/llm`
-- ecommerce agents now live under a domain package at `src/agents/ecommerce`
-- the current agent entrypoint uses `agent.py`
-- tools and types live directly inside each agent package instead of a nested `config` package
-
-One cleanup item outside the Python package structure:
-
-- the top-level `ecommerce-agent/` folder is currently empty and does not appear to be part of the package layout; it should either be removed or repurposed to avoid confusion
+See [src/agents/portfolio/README.md](src/agents/portfolio/README.md) for the full portfolio documentation.
 
 ## Technologies Used
 

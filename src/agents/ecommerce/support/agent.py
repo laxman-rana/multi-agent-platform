@@ -1,4 +1,5 @@
 import json
+import argparse
 from functools import lru_cache
 
 from langchain_core.callbacks import StreamingStdOutCallbackHandler
@@ -6,7 +7,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langgraph.graph import StateGraph
 
 from src.llm import get_llm
-from src.observability.traceloop_logger import TraceLoopLogger
+from src.observability import get_telemetry_logger
 
 from .tools import TOOLS
 from .types import AgentState
@@ -23,11 +24,11 @@ def get_agent_llm():
     )
 
 
-@lru_cache(maxsize=1)
-def get_telemetry_logger() -> TraceLoopLogger:
-    """Build the telemetry logger lazily so env issues do not break import."""
+def clear_cached_dependencies() -> None:
+    """Clear cached singleton-style dependencies for a fresh runtime state."""
 
-    return TraceLoopLogger()
+    get_agent_llm.cache_clear()
+    get_telemetry_logger.cache_clear()
 
 
 def invoke_model(state: AgentState) -> AgentState:
@@ -155,7 +156,10 @@ def construct_graph():
     return graph.compile()
 
 
-def main():
+def main(clear_cache: bool = False):
+    if clear_cache:
+        clear_cached_dependencies()
+
     graph = construct_graph()
     scenarios = [
         {
@@ -231,4 +235,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run ecommerce support agent demo scenarios.")
+    parser.add_argument(
+        "-e",
+        "--evict-cache",
+        action="store_true",
+        help="Clear cached LLM and logger instances before running.",
+    )
+    args = parser.parse_args()
+    main(clear_cache=args.evict_cache)

@@ -26,16 +26,13 @@ class TraceLoopLogger(TelemetryLogger):
         if not self.enabled:
             return
         print(f"[TraceLoop] Logging event: {event_name} with data: {data}")
-        # self.client.log_event(event_name, data)
 
     def log_tool_usage(self, tool_name: str, input_data: dict, output_data: dict):
         if not self.enabled:
             return
         print(f"[TraceLoop] Tool used: {tool_name}, Input: {input_data}, Output: {output_data}")
-        # self.client.log_tool_usage(tool_name, input_data, output_data)
 
     def log_llm_interaction(self, prompt: str, response: str):
         if not self.enabled:
             return
         print(f"[TraceLoop] LLM Interaction - Prompt: {prompt}, Response: {response}")
-        # self.client.log_llm_interaction(prompt, response)

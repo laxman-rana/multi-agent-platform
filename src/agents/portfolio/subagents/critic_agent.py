@@ -1,0 +1,83 @@
+from typing import Any, Dict
+
+from src.agents.portfolio.state import PortfolioState
+from src.observability import get_telemetry_logger
+
+
+# Flag if more than this fraction of positions are EXIT recommendations
+_MAX_EXIT_RATE = 0.5
+
+# Confidence levels ranked lowest → highest
+_CONFIDENCE_RANK: Dict[str, int] = {"low": 0, "moderate": 1, "high": 2}
+
+
+class CriticAgent:
+    """
+    Validates DecisionAgent output for quality and portfolio-level consistency.
+
+    Checks performed:
+    - Rejects any decision with "low" confidence
+    - Flags high exit rates across the whole portfolio
+    - Flags double-down decisions on positions already down >20%
+    """
+
+    def run(self, state: PortfolioState) -> PortfolioState:
+        decisions = state.decisions
+        feedback: Dict[str, Any] = {
+            "approved": True,
+            "warnings": [],
+            "per_ticker": {},
+        }
+
+        # Portfolio-level check: too many exits at once
+        exit_count = sum(1 for d in decisions.values() if d["action"] == "EXIT")
+        exit_rate = exit_count / len(decisions) if decisions else 0
+
+        if exit_rate > _MAX_EXIT_RATE:
+            feedback["warnings"].append(
+                f"High exit rate ({exit_rate:.0%}) across portfolio. "
+                f"Verify this aligns with your long-term strategy before acting."
+            )
+
+        # Per-ticker checks
+        for ticker, decision in decisions.items():
+            issues = []
+            conf = _CONFIDENCE_RANK.get(decision.get("confidence", "moderate"), 1)
+
+            if conf == 0:
+                issues.append("Low confidence — gather more data before acting.")
+                feedback["approved"] = False
+
+            if decision["action"] == "DOUBLE_DOWN" and decision.get("gain_pct", 0) < -20:
+                issues.append(
+                    "Doubling down on a >20% loss is high risk. Verify thesis first."
+                )
+                feedback["warnings"].append(
+                    f"{ticker}: Risky double-down on large loss flagged by critic."
+                )
+
+            feedback["per_ticker"][ticker] = {
+                "status": "flagged" if issues else "ok",
+                "issues": issues,
+            }
+
+        flagged = [t for t, v in feedback["per_ticker"].items() if v["status"] == "flagged"]
+        get_telemetry_logger().log_event(
+            "critic_review",
+            {
+                "approved": feedback["approved"],
+                "warning_count": len(feedback["warnings"]),
+                "flagged_tickers": flagged,
+                "warnings": feedback["warnings"],
+            },
+        )
+
+        approved_label = "APPROVED" if feedback["approved"] else "NEEDS REVIEW"
+        print(
+            f"  Critic: {approved_label} | "
+            f"Warnings: {len(feedback['warnings'])} | "
+            f"Flagged tickers: {len(flagged)}"
+        )
+
+        state.critic_feedback = feedback
+        return state
