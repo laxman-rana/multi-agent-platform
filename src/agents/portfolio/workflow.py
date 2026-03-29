@@ -38,6 +38,33 @@ def volatility_router(state: PortfolioState) -> str:
     return "normal"
 
 
+_MAX_CRITIC_RETRIES = 2
+
+
+def critic_router(state: PortfolioState) -> str:
+    """
+    Conditional routing function called after CriticAgent.
+
+    Returns "retry" to loop back to DecisionAgent when the critic rejected
+    the decisions and we have not yet exhausted the retry budget.
+    Returns "formatter" otherwise (approved, or retry budget spent).
+    """
+    if (
+        not state.critic_feedback.get("approved", True)
+        and state.critic_retry_count < _MAX_CRITIC_RETRIES
+    ):
+        return "retry"
+    return "formatter"
+
+
+def _increment_retry(state: PortfolioState) -> PortfolioState:
+    state.critic_retry_count += 1
+    print(
+        f"  [Graph] Critic loop retry #{state.critic_retry_count}/{_MAX_CRITIC_RETRIES}"
+    )
+    return state
+
+
 def build_graph(skip_news: bool = False):
     """
     Assemble and wire the agent graph using LangGraph StateGraph.
@@ -69,6 +96,7 @@ def build_graph(skip_news: bool = False):
     graph.add_node("news_agent",      NewsAgent().run)
     graph.add_node("decision",        DecisionAgent().run)
     graph.add_node("critic",          CriticAgent().run)
+    graph.add_node("retry_handler",   _increment_retry)
     graph.add_node("formatter",       FormatterAgent().run)
 
     # Entry point and linear edges
@@ -92,7 +120,15 @@ def build_graph(skip_news: bool = False):
         graph.add_edge("news_agent", "decision")
 
     graph.add_edge("decision", "critic")
-    graph.add_edge("critic",   "formatter")
+    graph.add_conditional_edges(
+        "critic",
+        critic_router,
+        {
+            "retry":     "retry_handler",
+            "formatter": "formatter",
+        },
+    )
+    graph.add_edge("retry_handler", "decision")
     graph.add_edge("formatter", END)
 
     return graph.compile()

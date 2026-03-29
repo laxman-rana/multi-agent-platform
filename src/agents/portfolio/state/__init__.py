@@ -33,5 +33,9 @@ class PortfolioState:
     # Critic validation result: approved flag + per-ticker issues + warnings
     critic_feedback: Dict[str, Any] = field(default_factory=dict)
 
+    # Number of times DecisionAgent has been re-run due to critic rejection.
+    # Managed by the graph layer (workflow.py) — agents must not write this field.
+    critic_retry_count: int = 0
+
     # Final human-readable report produced by FormatterAgent
     final_output: str = ""

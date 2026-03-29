@@ -19,6 +19,10 @@ class CriticAgent:
     - Rejects any decision with "low" confidence
     - Flags high exit rates across the whole portfolio
     - Flags double-down decisions on positions already down >20%
+
+    Sets critic_feedback["approved"] = False when re-run is required.
+    Sets critic_feedback["feedback"] to a human-readable summary of issues
+    which DecisionAgent appends to its prompt on the next retry.
     """
 
     def run(self, state: PortfolioState) -> PortfolioState:
@@ -27,6 +31,7 @@ class CriticAgent:
             "approved": True,
             "warnings": [],
             "per_ticker": {},
+            "feedback": "",
         }
 
         # Portfolio-level check: too many exits at once
@@ -44,7 +49,7 @@ class CriticAgent:
             issues = []
             conf = _CONFIDENCE_RANK.get(decision.get("confidence", "moderate"), 1)
 
-            if conf == 0:
+            if conf == 0:  # low confidence
                 issues.append("Low confidence — gather more data before acting.")
                 feedback["approved"] = False
 
@@ -61,6 +66,15 @@ class CriticAgent:
                 "issues": issues,
             }
 
+        # Build a single feedback string for DecisionAgent's retry prompt
+        if not feedback["approved"]:
+            issue_lines = [
+                f"{ticker}: {issue}"
+                for ticker, data in feedback["per_ticker"].items()
+                for issue in data["issues"]
+            ]
+            feedback["feedback"] = "; ".join(issue_lines)
+
         flagged = [t for t, v in feedback["per_ticker"].items() if v["status"] == "flagged"]
         get_telemetry_logger().log_event(
             "critic_review",
@@ -72,12 +86,17 @@ class CriticAgent:
             },
         )
 
-        approved_label = "APPROVED" if feedback["approved"] else "NEEDS REVIEW"
-        print(
-            f"  Critic: {approved_label} | "
-            f"Warnings: {len(feedback['warnings'])} | "
-            f"Flagged tickers: {len(flagged)}"
-        )
+        if not feedback["approved"]:
+            print(
+                f"  [CriticAgent] REJECTED — retry will be triggered | "
+                f"Flagged: {flagged} | Feedback: {feedback['feedback']}"
+            )
+        else:
+            print(
+                f"  [CriticAgent] APPROVED | "
+                f"Warnings: {len(feedback['warnings'])} | "
+                f"Flagged tickers: {len(flagged)}"
+            )
 
         state.critic_feedback = feedback
         return state

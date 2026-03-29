@@ -1,13 +1,14 @@
 import json
 import os
 from functools import lru_cache
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 from langchain_core.callbacks import StreamingStdOutCallbackHandler
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from src.agents.portfolio.state import PortfolioState
+from src.agents.portfolio.tools.validation import validate_decision
 from src.observability import get_telemetry_logger
 from src.llm import get_llm
 
@@ -88,15 +89,34 @@ def _build_human_message(
     insight: Dict[str, Any],
     news: List[Dict[str, str]],
     gain_pct: float,
+    stock_allocation_pct: Optional[float] = None,
+    critic_issues: Optional[List[str]] = None,
 ) -> str:
     news_lines = "\n".join(
         f"  - [{n.get('sentiment', 'neutral').upper()}] {n['headline']}" for n in news
     ) or "  (no recent news)"
 
-    pe_trailing = insight.get('pe_ratio', 0)
-    pe_forward  = insight.get('forward_pe', 0)
-    pe_trailing_str = f"{pe_trailing:.1f}" if pe_trailing else "N/A"
-    pe_forward_str  = f"{pe_forward:.1f}"  if pe_forward  else "N/A"
+    pe_trailing = insight.get('pe_ratio')
+    pe_forward  = insight.get('forward_pe')
+    pe_trailing_str = f"{pe_trailing:.1f}" if pe_trailing is not None else "N/A"
+    pe_forward_str  = f"{pe_forward:.1f}"  if pe_forward  is not None else "N/A"
+
+    if stock_allocation_pct is not None:
+        conc_flag = " \u26a0 HIGH CONCENTRATION" if stock_allocation_pct > 40 else ""
+        weight_line = f"Portfolio weight: {stock_allocation_pct:.1f}%{conc_flag}\n"
+    else:
+        weight_line = ""
+
+    critic_block = ""
+    if critic_issues:
+        formatted = "\n".join(f"  - {issue}" for issue in critic_issues)
+        critic_block = (
+            f"\n--------------------------------------------------\n"
+            f"PREVIOUS ATTEMPT REJECTED BY CRITIC:\n"
+            f"{formatted}\n"
+            f"Address ALL of the above issues in your new response.\n"
+            f"--------------------------------------------------\n"
+        )
 
     return (
         f"Ticker        : {ticker}\n"
@@ -108,7 +128,9 @@ def _build_human_message(
         f"Trailing P/E  : {pe_trailing_str}\n"
         f"Forward P/E   : {pe_forward_str}\n"
         f"52w high/low  : ${insight.get('52w_high', 0):.2f} / ${insight.get('52w_low', 0):.2f}\n"
-        f"\nRecent news:\n{news_lines}\n\n"
+        f"{weight_line}"
+        f"\nRecent news:\n{news_lines}\n"
+        f"{critic_block}\n"
         "What is your recommendation? Respond with JSON only."
     )
 
@@ -155,13 +177,30 @@ class DecisionAgent:
 
     def run(self, state: PortfolioState) -> PortfolioState:
         decisions: dict = {}
-
         telemetry = get_telemetry_logger()
+        is_retry = state.critic_retry_count > 0
+        stock_allocation: Dict[str, float] = state.risk_metrics.get("stock_allocation", {})
+
+        if is_retry:
+            print(
+                f"  [DecisionAgent] Retry #{state.critic_retry_count} after critic rejection"
+            )
 
         for ticker, insight in state.stock_insights.items():
             news = state.news.get(ticker, [])
             gain_pct = ((insight["price"] - insight["avg_cost"]) / insight["avg_cost"]) * 100
-            decision = self._decide(ticker, insight, news, gain_pct)
+
+            allocation_pct = stock_allocation.get(ticker)
+            per_ticker_feedback = state.critic_feedback.get("per_ticker", {})
+            critic_issues: Optional[List[str]] = (
+                per_ticker_feedback.get(ticker, {}).get("issues") or None
+                if is_retry
+                else None
+            )
+
+            decision = self._decide(
+                ticker, insight, news, gain_pct, allocation_pct, critic_issues
+            )
             decisions[ticker] = decision
             telemetry.log_event(
                 "decision_made",
@@ -171,12 +210,14 @@ class DecisionAgent:
                     "confidence": decision["confidence"],
                     "gain_pct": decision["gain_pct"],
                     "news_count": len(news),
+                    "retry": is_retry,
                 },
             )
+            alloc_note = f" weight={allocation_pct:.1f}%" if allocation_pct is not None else ""
             print(
-                f"  {ticker}: {decision['action']:<13} "
+                f"  [DecisionAgent] {ticker}: {decision['action']:<13} "
                 f"[{decision['confidence'].upper()}]  "
-                f"gain: {decision['gain_pct']:+.1f}%"
+                f"gain: {decision['gain_pct']:+.1f}%{alloc_note}"
             )
 
         state.decisions = decisions
@@ -188,18 +229,47 @@ class DecisionAgent:
         insight: Dict[str, Any],
         news: List[Dict[str, str]],
         gain_pct: float,
+        stock_allocation_pct: Optional[float] = None,
+        critic_issues: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         telemetry = get_telemetry_logger()
-        human_msg = _build_human_message(ticker, insight, news, gain_pct)
+        human_msg = _build_human_message(
+            ticker, insight, news, gain_pct, stock_allocation_pct, critic_issues
+        )
         llm = _get_decision_llm()
         messages = [
             SystemMessage(content=_SYSTEM_PROMPT),
             HumanMessage(content=human_msg),
         ]
-        response = llm.invoke(messages)
-        result = _parse_llm_response(response.content, gain_pct)
-        telemetry.log_llm_interaction(
-            prompt=f"[{ticker}] {human_msg}",
-            response=response.content,
+
+        last_error: Exception = RuntimeError("No attempts made")
+        for attempt in range(2):
+            response = llm.invoke(messages)
+            telemetry.log_llm_interaction(
+                prompt=f"[{ticker}] {human_msg}",
+                response=response.content,
+            )
+            try:
+                result = _parse_llm_response(response.content, gain_pct)
+                valid, val_err = validate_decision(result)
+                if not valid:
+                    raise ValueError(val_err)
+                return result
+            except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                last_error = exc
+                if attempt == 0:
+                    # Append the bad response and a correction request so the
+                    # model can see what it produced and why it was rejected.
+                    messages.append(AIMessage(content=response.content))
+                    messages.append(
+                        HumanMessage(
+                            content=(
+                                f"Your previous response was invalid: {exc}\n"
+                                "Return ONLY a valid JSON object matching the required schema."
+                            )
+                        )
+                    )
+
+        raise ValueError(
+            f"[DecisionAgent] {ticker}: LLM produced invalid output after 2 attempts: {last_error}"
         )
-        return result

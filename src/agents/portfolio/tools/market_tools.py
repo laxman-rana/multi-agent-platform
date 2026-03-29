@@ -42,8 +42,10 @@ def _fetch_live(ticker: str) -> Dict[str, Any]:
         "price":      round(float(price), 2),
         "change_pct": change_pct,
         "volatility": volatility,
-        "pe_ratio":   info.get("trailingPE") or 0.0,
-        "forward_pe": info.get("forwardPE") or 0.0,
+        # None when yfinance doesn't have data — displayed as N/A in the LLM prompt
+        # so the model does not invent a value.
+        "pe_ratio":   info.get("trailingPE"),
+        "forward_pe": info.get("forwardPE"),
         "52w_high":   info.get("fiftyTwoWeekHigh", 0.0),
         "52w_low":    info.get("fiftyTwoWeekLow", 0.0),
     }

@@ -10,10 +10,12 @@ def calculate_risk(
 
     Returns:
         total_portfolio_value, unrealized_pnl, unrealized_pnl_pct,
-        weighted_volatility, sector_allocation, concentration_risk label.
+        weighted_volatility, sector_allocation, stock_allocation,
+        concentration_risk label, top_stock, high_concentration flag.
     """
     total_value = 0.0
     sector_values: Dict[str, float] = {}
+    stock_market_values: Dict[str, float] = {}  # per-ticker market value for concentration
     weighted_volatility = 0.0
     unrealized_pnl = 0.0
 
@@ -31,6 +33,7 @@ def calculate_risk(
         cost_basis = shares * avg_cost
 
         total_value += market_value
+        stock_market_values[ticker] = market_value
         sector_values[sector] = sector_values.get(sector, 0.0) + market_value
         unrealized_pnl += market_value - cost_basis
         weighted_volatility += market_value * volatility
@@ -46,8 +49,21 @@ def calculate_risk(
         for sector, val in sector_values.items()
     }
 
+    # Per-stock weight — used by DecisionAgent to flag concentration risk in prompts
+    stock_allocation = {
+        ticker: round((val / total_value) * 100, 2)
+        for ticker, val in stock_market_values.items()
+    }
+
     top_sector = max(sector_allocation, key=lambda s: sector_allocation[s])
     top_pct = sector_allocation[top_sector]
+
+    top_stock = max(stock_allocation, key=lambda t: stock_allocation[t])
+
+    # Stocks whose individual weight exceeds 40% of the portfolio
+    high_concentration_stocks = [
+        t for t, pct in stock_allocation.items() if pct > 40
+    ]
 
     if top_pct > 40:
         concentration_risk = "high"
@@ -64,6 +80,10 @@ def calculate_risk(
         ),
         "weighted_volatility": round(weighted_volatility, 4),
         "sector_allocation": sector_allocation,
+        "stock_allocation": stock_allocation,
         "top_sector": top_sector,
+        "top_stock": top_stock,
+        "high_concentration_stocks": high_concentration_stocks,
+        "high_concentration": len(high_concentration_stocks) > 0,
         "concentration_risk": concentration_risk,
     }
