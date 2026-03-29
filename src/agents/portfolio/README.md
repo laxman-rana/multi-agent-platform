@@ -132,7 +132,10 @@ src/agents/portfolio/
     ├── portfolio_tools.py      ← user profile + position loader
     ├── market_tools.py         ← live price, volatility, trailing/forward P/E via yfinance
     ├── news_tools.py           ← live headlines + VADER sentiment
-    └── risk_tools.py           ← portfolio risk calculator
+    ├── risk_tools.py           ← portfolio risk calculator
+    ├── scoring.py              ← deterministic quantitative score per ticker
+    ├── rebalance_tools.py      ← portfolio-level rebalance / diversification logic
+    └── validation.py           ← structural validation for DecisionAgent output
 ```
 
 The graph is assembled in `workflow.py` using LangGraph's `StateGraph`.
@@ -151,29 +154,31 @@ anything.
 ```python
 @dataclass
 class PortfolioState:
-    user_profile:     Dict[str, Any]            # investor name, risk tolerance, horizon
-    portfolio:        List[Dict[str, Any]]       # raw positions: ticker, shares, avg_cost, sector
-    sector_allocation: Dict[str, float]          # sector → portfolio weight (%)
-    risk_metrics:     Dict[str, Any]             # concentration, volatility, PnL totals
-    stock_insights:   Dict[str, Dict[str, Any]]  # per-ticker enriched market data
-    news:             Dict[str, List[...]]        # per-ticker headlines (high-vol tickers only)
-    decisions:        Dict[str, Dict[str, Any]]  # ticker → action, reason, confidence, gain_pct
-    critic_feedback:  Dict[str, Any]             # approved flag, warnings, per-ticker issues
-    final_output:     str                        # rendered report text
+    user_profile:      Dict[str, Any]            # investor name, risk tolerance, horizon
+    portfolio:         List[Dict[str, Any]]       # raw positions: ticker, shares, avg_cost, sector
+    sector_allocation: Dict[str, float]           # sector → portfolio weight (%)
+    risk_metrics:      Dict[str, Any]             # concentration, volatility, PnL totals
+    stock_insights:    Dict[str, Dict[str, Any]]  # per-ticker enriched market data
+    news:              Dict[str, List[...]]        # per-ticker headlines (high-vol tickers only)
+    decisions:         Dict[str, Dict[str, Any]]  # ticker → action, confidence, reason, gain_pct, allocation_change
+    critic_feedback:   Dict[str, Any]             # approved flag, warnings, per-ticker issues
+    portfolio_action:  Dict[str, Any]             # deterministic rebalance / diversification recommendation
+    final_output:      str                        # rendered report text
 ```
 
 ### Field Ownership
 
 | Field               | Written by       | Read by                                                             |
 | ------------------- | ---------------- | ------------------------------------------------------------------- |
-| `user_profile`      | `PortfolioAgent` | `FormatterAgent`                                                    |
-| `portfolio`         | `PortfolioAgent` | `RiskAgent`, `MarketAgent`                                          |
-| `sector_allocation` | `RiskAgent`      | `FormatterAgent`                                                    |
-| `risk_metrics`      | `RiskAgent`      | `FormatterAgent`                                                    |
+| `user_profile`      | `PortfolioAgent` | `DecisionAgent`, `FormatterAgent`                                   |
+| `portfolio`         | `PortfolioAgent` | `RiskAgent`, `MarketAgent`, `DecisionAgent`                         |
+| `sector_allocation` | `RiskAgent`      | `DecisionAgent`, `FormatterAgent`                                   |
+| `risk_metrics`      | `RiskAgent`      | `DecisionAgent`, `FormatterAgent`                                   |
 | `stock_insights`    | `MarketAgent`    | `NewsAgent`, `DecisionAgent`, `FormatterAgent`, `volatility_router` |
 | `news`              | `NewsAgent`      | `DecisionAgent`, `FormatterAgent`                                   |
 | `decisions`         | `DecisionAgent`  | `CriticAgent`, `FormatterAgent`                                     |
 | `critic_feedback`   | `CriticAgent`    | `FormatterAgent`                                                    |
+| `portfolio_action`  | `DecisionAgent`  | `FormatterAgent`                                                    |
 | `final_output`      | `FormatterAgent` | `workflow.py` (print)                                               |
 
 ---
@@ -285,6 +290,10 @@ Each entry in `state.news[ticker]` is a list of:
 from `yfinance` and scores each headline with VADER sentiment analysis.
 Returns `[]` on any fetch error.
 
+**Empty-result handling:** tickers that return zero articles are not stored in
+`state.news`. The DecisionAgent prompt omits the `Recent news:` block entirely
+for those tickers — no noise from empty sections.
+
 ---
 
 ### DecisionAgent
@@ -301,12 +310,80 @@ Each entry in `state.decisions[ticker]`:
 
 ```python
 {
-    "action":     "EXIT" | "HOLD" | "DOUBLE_DOWN",
-    "confidence": "high" | "moderate" | "low",
-    "reason":     str,       # human-readable explanation
-    "gain_pct":   float,     # (current_price / avg_cost − 1) × 100
+    "action":            "EXIT" | "REDUCE" | "HOLD" | "DOUBLE_DOWN",
+    "confidence":        "high" | "moderate" | "low",
+    "reason":            str,     # human-readable explanation
+    "gain_pct":          float,   # (current_price / avg_cost − 1) × 100, computed locally
+    "allocation_change": str,     # e.g. "-15%", "+10%", "0%", "-100%"
 }
 ```
+
+#### Actions
+
+| Action        | Meaning                                                         |
+| ------------- | --------------------------------------------------------------- |
+| `EXIT`        | Close the full position (`allocation_change` is always `-100%`) |
+| `REDUCE`      | Trim part of the position (e.g. `-15%`)                         |
+| `HOLD`        | No change (`allocation_change` is always `0%`)                  |
+| `DOUBLE_DOWN` | Add to the position (e.g. `+10%`)                               |
+
+#### Allocation change
+
+`allocation_change` is a signed percentage string giving the recommended
+change to the position's allocation weight. It is determined by a combination
+of LLM reasoning and deterministic post-process rules:
+
+- `EXIT` → always `-100%`; `HOLD` → always `0%` (overridden in code)
+- `REDUCE`: clamped to `[-50%, -5%]` — score -1 → ~`-10%`; score ≤-3 → `~-30%` to `-50%`
+- `DOUBLE_DOWN`: clamped to `[+5%, +20%]` — score +2 → `+5%`; score ≥4 → `+15%`
+
+#### DOUBLE_DOWN threshold
+
+`DOUBLE_DOWN` requires a quantitative score ≥ 2. A score of +1 is a weak buy
+signal and is automatically downgraded to `HOLD` with a note prepended to the
+reason. This prevents the LLM from aggressively adding to positions on thin
+conviction.
+
+#### Confidence calibration
+
+LLM-reported confidence is overridden deterministically after each response:
+
+| `abs(score)` | Confidence |
+| ------------ | ---------- |
+| 0 or 1       | `moderate` |
+| ≥ 2          | `high`     |
+
+#### Time horizon awareness
+
+The investor's `investment_horizon` (e.g. `"5 years"`, `"18 months"`) is
+parsed into a float and injected as an `INVESTMENT HORIZON` section in the
+system prompt. For long-term horizons (≥ 3 years):
+
+- The daily price change signal is suppressed in the quantitative score
+- The prompt instructs the LLM that daily moves are noise and `HOLD` is
+  strongly preferred unless the thesis is broken or the loss exceeds −35 %
+
+#### Parallel execution
+
+All per-ticker LLM calls are dispatched concurrently via a `ThreadPoolExecutor`
+(`max_workers = n_tickers`). Telemetry and logging run sequentially after all
+futures complete. This reduces total execution time from ~`n × 5s` to ~`5–8s`
+regardless of portfolio size.
+
+#### Quantitative scoring
+
+Before calling the LLM, `tools/scoring.py::score_stock()` computes a
+deterministic integer score from market data. The score and the tier label
+are injected into the prompt as the primary decision anchor:
+
+| Score   | Tier          | LLM guidance                                 |
+| ------- | ------------- | -------------------------------------------- |
+| ≥ 3     | `strong_buy`  | Lean toward `DOUBLE_DOWN`                    |
+| +2      | `buy`         | `HOLD` or `DOUBLE_DOWN`                      |
+| +1      | `buy`         | `HOLD` only (insufficient for `DOUBLE_DOWN`) |
+| 0       | `neutral`     | `HOLD`                                       |
+| −1 / −2 | `sell`        | `REDUCE` before considering `EXIT`           |
+| ≤ −3    | `strong_sell` | `EXIT`; `REDUCE` if long-term thesis intact  |
 
 #### LLM provider selection
 
@@ -319,8 +396,7 @@ python -m src.agents.portfolio.workflow
 
 The agent uses `get_llm()` from `src/llm/providers.py` (the same factory used
 by the ecommerce agent) behind an `@lru_cache(maxsize=1)` singleton.
-A structured JSON prompt asks the model for `action`, `confidence`, and
-`reason`; `gain_pct` is computed locally so arithmetic is always exact.
+`gain_pct` is computed locally so portfolio arithmetic is always exact.
 
 If the LLM call fails or returns unparseable output, the exception propagates —
 there is no silent fallback. Configure the provider before running (see above).
@@ -340,11 +416,11 @@ Does **not** change any decisions — only annotates `critic_feedback`.
 
 **Checks performed:**
 
-| Check                    | Threshold                                      | Effect                                     |
-| ------------------------ | ---------------------------------------------- | ------------------------------------------ |
-| High portfolio exit rate | > 50 % of positions are EXIT                   | Adds portfolio-level warning               |
-| Low-confidence decision  | `confidence == "low"`                          | Sets `approved = False`, flags ticker      |
-| Risky double-down        | `action == DOUBLE_DOWN` and `gain_pct < −20 %` | Adds portfolio-level warning, flags ticker |
+| Check                   | Threshold                                      | Effect                                     |
+| ----------------------- | ---------------------------------------------- | ------------------------------------------ |
+| High exit/reduce rate   | > 50 % of positions are `EXIT` or `REDUCE`     | Adds portfolio-level warning               |
+| Low-confidence decision | `confidence == "low"`                          | Sets `approved = False`, flags ticker      |
+| Risky double-down       | `action == DOUBLE_DOWN` and `gain_pct < −20 %` | Adds portfolio-level warning, flags ticker |
 
 `state.critic_feedback` structure:
 
@@ -380,16 +456,18 @@ after `engine.run()` returns.
 1. **Header** — investor name, risk level, investment horizon
 2. **Portfolio Summary** — total value, P&L, weighted volatility, concentration
 3. **Sector Allocation** — bar chart sorted by weight descending
-4. **Stock Decisions** — per-ticker action icon, confidence, P&L, price, reason, critic issues
-5. **News** _(only when `state.news` is non-empty)_ — headlines with sentiment arrows
-6. **Critic Warnings** — portfolio-level flags from `CriticAgent`
-7. **Footer** — disclaimer
+4. **Stock Decisions** — per-ticker action icon, confidence, `allocation_change`, P&L, price, reason, critic issues
+5. **Portfolio Action** — deterministic rebalance / diversification recommendation (sector > 60 % threshold)
+6. **News** _(only when `state.news` is non-empty)_ — headlines with sentiment arrows
+7. **Critic Warnings** — portfolio-level flags from `CriticAgent`
+8. **Footer** — disclaimer
 
 **Action icons:**
 
 | Action      | Icon |
 | ----------- | ---- |
 | EXIT        | 🔴   |
+| REDUCE      | 🟠   |
 | HOLD        | 🟡   |
 | DOUBLE_DOWN | 🟢   |
 
@@ -401,6 +479,59 @@ Tool functions are stateless utilities called by agents. `market_tools` and
 `news_tools` fetch live data; `portfolio_tools` reads from `mock_data.py`.
 To connect a real brokerage, replace only the `get_portfolio()` body in
 `portfolio_tools.py` — no agent code needs to change.
+
+---
+
+### scoring
+
+**File:** `tools/scoring.py`  
+**Function:** `score_stock(insight, gain_pct, horizon_years) → Dict`
+
+Computes a deterministic integer score (typically −4 to +4) from market data
+without calling the LLM. Each signal contributes ±1 point:
+
+| Signal                         | Threshold                    |
+| ------------------------------ | ---------------------------- |
+| Daily change (short-term only) | ±3 % triggers ±1             |
+| Unrealized gain/loss           | −20 %/+20 % triggers ±1      |
+| 52-week range position         | Near high or low triggers ±1 |
+| Forward vs trailing P/E ratio  | Improving/deteriorating ±1   |
+
+For horizons ≥ 3 years the daily-change signal is suppressed entirely.
+The result includes a `long_term: bool` flag so the prompt can note when
+daily change was excluded.
+
+---
+
+### rebalance_tools
+
+**File:** `tools/rebalance_tools.py`  
+**Function:** `compute_portfolio_action(sector_allocation, decisions, risk_metrics, portfolio) → Dict`
+
+Produces a deterministic portfolio-level action recommendation (independent of
+the LLM). Two rules are evaluated:
+
+| Rule                  | Threshold  | Output                                                  |
+| --------------------- | ---------- | ------------------------------------------------------- |
+| Top-sector overweight | > 60 %     | `rebalance=True`, `reduce_sector`, `priority_exits`     |
+| Too few sectors       | < 3 unique | `add_diversification=True`, `missing_sectors` (up to 4) |
+
+The result is stored in `state.portfolio_action` and rendered in the
+`── PORTFOLIO ACTION ──` section of the report.
+
+---
+
+### validation
+
+**File:** `tools/validation.py`  
+**Function:** `validate_decision(decision) → (bool, str)`
+
+Structural validation called after every LLM response. Checks:
+
+- `action` is one of `EXIT | REDUCE | HOLD | DOUBLE_DOWN`
+- `confidence` is one of `high | moderate | low`
+- `reason` is a non-empty string
+- `allocation_change` matches `^[+-]?\d+(\.\d+)?%$`
 
 ---
 
@@ -537,19 +668,27 @@ news data is not required.
   Concentration    :          HIGH
 
 ── SECTOR ALLOCATION ───────────────────────────────────────────────
-  Technology            49.3%  █████████
+  Technology            69.3%  █████████████
   Finance               10.2%  ██
-  Healthcare             6.6%  █
-  Automotive             3.1%
+  Consumer Cyclical      9.1%  █
+  Communication          8.8%  █
 
 ── STOCK DECISIONS ─────────────────────────────────────────────────
-  🟡  AAPL    HOLD         [HIGH]   PnL: +22.3%  @ $189.50
-       → Healthy gain of 22.3% with clean news feed. Thesis intact.
-  🟡  MSFT    HOLD         [HIGH]   PnL: +48.2%  @ $415.00
-       → Healthy gain of 48.2% with clean news feed. Thesis intact.
-  ...
-  🔴  TSLA    EXIT         [HIGH]   PnL: -20.5%  @ $175.00
+  🟡  MSFT    HOLD          [HIGH]    alloc:    0%  PnL: +48.2%  @ $415.00
+       → Strong fundamentals and forward PE improving. Thesis intact.
+  🟢  NVDA    DOUBLE_DOWN   [HIGH]    alloc:  +10%  PnL: +12.1%  @ $875.00
+       → Score +3: strong buy. 52w range near mid-point; earnings growth intact.
+  🟠  META    REDUCE        [HIGH]    alloc:  -15%  PnL:  -8.3%  @ $412.50
+       → Score -1: weak sell. Trim overweight position while thesis remains intact.
+  🔴  TSLA    EXIT          [HIGH]    alloc: -100%  PnL: -20.5%  @ $175.00
        → Down 20.5% with high volatility (55%). Risk-reward is unfavourable. Cut losses.
+
+── PORTFOLIO ACTION ────────────────────────────────────────────────
+  ⚠  REBALANCE RECOMMENDED
+  Reduce sector  : Technology (currently 69.3% → target ≤ 60%)
+  Priority exits : TSLA  (already flagged for EXIT)
+  Diversify into : Healthcare, Consumer Staples
+  Summary        : Technology overweight at 69.3%; trim to ≤60% target.
 
 ── NEWS  (High-Volatility Tickers) ─────────────────────────────────
   TSLA:

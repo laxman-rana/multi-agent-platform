@@ -5,7 +5,7 @@ This repository hosts multiple AI agents across different business domains. It p
 Two agents are currently implemented:
 
 - **E-commerce support agent** — LangGraph-based customer support workflow with tool-calling (refunds, messaging)
-- **Portfolio analysis agent** — LangGraph multi-agent pipeline that analyses an investor's equity portfolio using live market data (yfinance) and an LLM to produce hold/exit/double-down recommendations
+- **Portfolio analysis agent** — LangGraph multi-agent pipeline that analyses an investor's equity portfolio using live market data (yfinance) and an LLM to produce hold/reduce/exit/double-down recommendations with actionable allocation changes
 
 The goal is to use the same shared foundation for additional agents such as fulfillment, finance, operations, HR, or other domain-specific assistants.
 
@@ -42,7 +42,7 @@ Each agent package can define its own:
 - `src/agents/ecommerce/support/types.py`: state types
 - `src/agents/portfolio/workflow.py`: portfolio analysis entry point (LangGraph `StateGraph`)
 - `src/agents/portfolio/subagents/`: 7 pipeline nodes (portfolio, risk, market, news, decision, critic, formatter)
-- `src/agents/portfolio/tools/`: live data tools (yfinance, VADER) and mock positions
+- `src/agents/portfolio/tools/`: live data tools (yfinance, VADER), scoring, rebalance logic, and mock positions
 - `src/agents/portfolio/state/`: `PortfolioState` dataclass
 - `src/requirements.txt`: Python dependencies
 
