@@ -155,6 +155,20 @@ def _sig_mean_reversion(
     )
 
 
+def _sig_news(news_score: int) -> Tuple[int, str]:
+    """
+    Aggregate news sentiment signal.
+
+    Converts the pre-computed news_score (from compute_news_score) into a
+    prompt signal.  The score is already normalised to -1 / 0 / +1.
+    """
+    if news_score == 1:
+        return +1, "News sentiment: POSITIVE (≥ majority positive headlines)"
+    if news_score == -1:
+        return -1, "News sentiment: NEGATIVE (≥ majority negative headlines)"
+    return 0, ""
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -163,6 +177,7 @@ def score_stock(
     insight: Dict[str, Any],
     gain_pct: float,
     horizon_years: float = 1.0,
+    news_score: int = 0,
 ) -> Dict[str, Any]:
     """
     Compute a deterministic quantitative score for a single position.
@@ -174,6 +189,8 @@ def score_stock(
     horizon_years  : investor's time horizon in years (default 1.0).
                      When ≥ 3 the daily-change signal is suppressed — a single
                      session's move is noise at a multi-year timescale.
+    news_score     : pre-computed aggregate news sentiment: +1, 0, or -1
+                     (from news_tools.compute_news_score). Defaults to 0 (neutral).
 
     Returns
     -------
@@ -206,6 +223,7 @@ def score_stock(
             insight.get("forward_pe"),
             gain_pct,
         ),
+        _sig_news(news_score),
     ]
 
     active = [(pts, label) for pts, label in raw_signals if pts != 0 and label]

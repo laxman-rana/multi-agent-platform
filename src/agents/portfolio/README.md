@@ -47,13 +47,13 @@ renders the final human-readable report.
 
 **Key design goals:**
 
-| Goal                | Implementation                                                         |
-| ------------------- | ---------------------------------------------------------------------- |
-| Single shared state | `PortfolioState` dataclass passed through every LangGraph node         |
-| Decoupled agents    | Each agent only reads/writes specific state fields                     |
-| Conditional logic   | Volatility-driven routing — skip or include `NewsAgent`                |
-| Real LLM decisions  | `DecisionAgent` calls `get_llm()` via `PORTFOLIO_LLM_PROVIDER` env var |
-| Live market data    | `market_tools` and `news_tools` fetch live data via `yfinance` + VADER |
+| Goal                | Implementation                                                                              |
+| ------------------- | ------------------------------------------------------------------------------------------- |
+| Single shared state | `PortfolioState` dataclass passed through every LangGraph node                              |
+| Decoupled agents    | Each agent only reads/writes specific state fields                                          |
+| Conditional logic   | Volatility-driven routing — skip or include `NewsAgent`                                     |
+| Real LLM decisions  | `DecisionAgent` calls `get_llm()` via `--provider` flag or `PORTFOLIO_LLM_PROVIDER` env var |
+| Live market data    | `market_tools` and `news_tools` fetch live data via `yfinance` + VADER + RSS fallback       |
 
 ---
 
@@ -131,7 +131,7 @@ src/agents/portfolio/
     ├── mock_data.py            ← mock investor profile + positions
     ├── portfolio_tools.py      ← user profile + position loader
     ├── market_tools.py         ← live price, volatility, trailing/forward P/E via yfinance
-    ├── news_tools.py           ← live headlines + VADER sentiment
+    ├── news_tools.py           ← live headlines + VADER sentiment + news score
     ├── risk_tools.py           ← portfolio risk calculator
     ├── scoring.py              ← deterministic quantitative score per ticker
     ├── rebalance_tools.py      ← portfolio-level rebalance / diversification logic
@@ -286,9 +286,14 @@ Each entry in `state.news[ticker]` is a list of:
 {"headline": str, "sentiment": "positive" | "negative" | "neutral"}
 ```
 
-**Data source:** `tools/news_tools.get_news(ticker)` — fetches live headlines
-from `yfinance` and scores each headline with VADER sentiment analysis.
-Returns `[]` on any fetch error.
+**Data source:** `tools/news_tools.get_news(ticker)` — two-stage fetch strategy:
+
+1. **Primary** — `yfinance` (`yf.Ticker(ticker).news`): no API key required.
+2. **Fallback** — RSS feeds (Google News, then Yahoo Finance RSS) via `feedparser`,
+   used automatically when yfinance returns zero articles.
+
+Both sources score every headline with VADER sentiment analysis.
+Returns `[]` only when both sources fail or are empty.
 
 **Empty-result handling:** tickers that return zero articles are not stored in
 `state.news`. The DecisionAgent prompt omits the `Recent news:` block entirely
@@ -373,8 +378,8 @@ regardless of portfolio size.
 #### Quantitative scoring
 
 Before calling the LLM, `tools/scoring.py::score_stock()` computes a
-deterministic integer score from market data. The score and the tier label
-are injected into the prompt as the primary decision anchor:
+deterministic integer score from market data and news sentiment. The score
+and the tier label are injected into the prompt as the primary decision anchor:
 
 | Score   | Tier          | LLM guidance                                 |
 | ------- | ------------- | -------------------------------------------- |
@@ -385,21 +390,40 @@ are injected into the prompt as the primary decision anchor:
 | −1 / −2 | `sell`        | `REDUCE` before considering `EXIT`           |
 | ≤ −3    | `strong_sell` | `EXIT`; `REDUCE` if long-term thesis intact  |
 
-#### LLM provider selection
+#### LLM provider and model selection
 
-Set the `PORTFOLIO_LLM_PROVIDER` environment variable before running:
+The provider and model can be set three ways (highest to lowest priority):
+
+| Method                       | Example                                                                           |
+| ---------------------------- | --------------------------------------------------------------------------------- |
+| CLI `--provider` / `--model` | `--provider openai --model gpt-4-turbo`                                           |
+| Environment variables        | `$env:PORTFOLIO_LLM_PROVIDER="openai"` / `$env:PORTFOLIO_LLM_MODEL="gpt-4-turbo"` |
+| Built-in defaults            | `ollama` / `gpt-oss:120b`                                                         |
 
 ```powershell
-$env:PORTFOLIO_LLM_PROVIDER = "openai"   # or "google", defaults to "ollama"
+# Use defaults (ollama / gpt-oss:120b)
 python -m src.agents.portfolio.workflow
+
+# Switch provider only
+python -m src.agents.portfolio.workflow --provider openai
+
+# Switch provider and model
+python -m src.agents.portfolio.workflow --provider openai --model gpt-4-turbo
+python -m src.agents.portfolio.workflow --provider google --model gemini-pro
+python -m src.agents.portfolio.workflow --provider ollama --model llama3
 ```
 
-The agent uses `get_llm()` from `src/llm/providers.py` (the same factory used
-by the ecommerce agent) behind an `@lru_cache(maxsize=1)` singleton.
-`gain_pct` is computed locally so portfolio arithmetic is always exact.
+Default models per provider:
 
-If the LLM call fails or returns unparseable output, the exception propagates —
-there is no silent fallback. Configure the provider before running (see above).
+| Provider | Default model    |
+| -------- | ---------------- |
+| `ollama` | `gpt-oss:120b`   |
+| `openai` | `gpt-4o`         |
+| `google` | `gemini-1.5-pro` |
+
+Unknown provider names are rejected at startup with a clear error message before
+any LLM call is made. Unknown model names (for custom/fine-tuned models not in
+the known list) emit a warning but still proceed.
 
 ---
 
@@ -485,21 +509,23 @@ To connect a real brokerage, replace only the `get_portfolio()` body in
 ### scoring
 
 **File:** `tools/scoring.py`  
-**Function:** `score_stock(insight, gain_pct, horizon_years) → Dict`
+**Function:** `score_stock(insight, gain_pct, horizon_years, news_score) → Dict`
 
-Computes a deterministic integer score (typically −4 to +4) from market data
+Computes a deterministic integer score (typically −5 to +5) from market data
 without calling the LLM. Each signal contributes ±1 point:
 
-| Signal                         | Threshold                    |
-| ------------------------------ | ---------------------------- |
-| Daily change (short-term only) | ±3 % triggers ±1             |
-| Unrealized gain/loss           | −20 %/+20 % triggers ±1      |
-| 52-week range position         | Near high or low triggers ±1 |
-| Forward vs trailing P/E ratio  | Improving/deteriorating ±1   |
+| Signal                         | Threshold                                                          |
+| ------------------------------ | ------------------------------------------------------------------ |
+| Daily change (short-term only) | ±3 % triggers ±1                                                   |
+| Unrealized gain/loss           | −20 %/+20 % triggers ±1                                            |
+| 52-week range position         | Near high or low triggers ±1                                       |
+| Forward vs trailing P/E ratio  | Improving/deteriorating ±1                                         |
+| News sentiment                 | Majority-positive → +1; majority-negative → −1 (via `_sig_news()`) |
 
-For horizons ≥ 3 years the daily-change signal is suppressed entirely.
-The result includes a `long_term: bool` flag so the prompt can note when
-daily change was excluded.
+`news_score` defaults to `0` (backward-compatible) so tickers without news
+are unaffected. For horizons ≥ 3 years the daily-change signal is suppressed
+entirely. The result includes a `long_term: bool` flag so the prompt can note
+when daily change was excluded.
 
 ---
 
@@ -562,12 +588,35 @@ the graph to route through `NewsAgent`.
 
 ### news_tools
 
-**File:** `tools/news_tools.py`  
-**Function:** `get_news(ticker: str) → List[Dict]`
+**File:** `tools/news_tools.py`
 
-Fetches recent headlines from `yf.Ticker(ticker).news` and scores each one
-with VADER sentiment analysis (`compound ≥ 0.05` → positive,
-`≤ −0.05` → negative, else neutral). Returns `[]` on any fetch error.
+#### `get_news(ticker: str) → List[Dict]`
+
+Two-stage fetch strategy:
+
+| Stage        | Source                                               | Condition                       |
+| ------------ | ---------------------------------------------------- | ------------------------------- |
+| 1 (primary)  | `yf.Ticker(ticker).news` via `yfinance`              | Always tried first              |
+| 2 (fallback) | Google News RSS → Yahoo Finance RSS via `feedparser` | Only when stage 1 returns empty |
+
+Every headline from either source is scored with VADER sentiment analysis
+(`compound ≥ 0.05` → positive, `≤ −0.05` → negative, else neutral).
+Returns `[]` only when both sources fail or are empty.
+
+#### `compute_news_score(articles: List[Dict]) → int`
+
+Collapses a list of VADER-scored articles into a single `−1 / 0 / +1` signal:
+
+1. Map each article: `positive → +1`, `neutral → 0`, `negative → −1`
+2. Sum all mapped values
+3. Sign-normalize: `sum > 0 → +1`, `sum == 0 → 0`, `sum < 0 → −1`
+4. Returns `0` for an empty list
+
+**Example:** sentiments `['negative', 'negative', 'positive', 'neutral', 'negative']`  
+→ mapped values `[−1, −1, +1, 0, −1]` → sum `−2` → **score `−1`**
+
+The result is passed to `score_stock(news_score=...)` in `DecisionAgent`, where
+`_sig_news()` translates it into the quantitative signal stack.
 
 ---
 
@@ -707,18 +756,26 @@ news data is not required.
 
 ## Extending the System
 
-### Switch the LLM provider
+### Switch the LLM provider or model
 
-Set `PORTFOLIO_LLM_PROVIDER` to `openai` or `google` before running — no code
-changes needed. The default is `ollama`.
+Use the `--provider` and `--model` CLI flags — no code or env var changes needed:
+
+```powershell
+python -m src.agents.portfolio.workflow --provider openai --model gpt-4-turbo
+python -m src.agents.portfolio.workflow --provider google --model gemini-pro
+python -m src.agents.portfolio.workflow --provider ollama --model llama3
+```
+
+Or set environment variables to make the selection persist across runs:
 
 ```powershell
 $env:PORTFOLIO_LLM_PROVIDER = "openai"
+$env:PORTFOLIO_LLM_MODEL    = "gpt-4-turbo"
 python -m src.agents.portfolio.workflow
 ```
 
-To customise the model within a provider, edit `src/llm/providers.py`
-(e.g. change `"gpt-4o"` to `"gpt-4-turbo"` inside `OpenAIProvider`).
+Running `python -m src.agents.portfolio.workflow --help` shows the current active
+provider and model in the flag descriptions.
 
 ### Add a new ticker
 

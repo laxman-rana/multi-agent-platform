@@ -42,7 +42,7 @@ Each agent package can define its own:
 - `src/agents/ecommerce/support/types.py`: state types
 - `src/agents/portfolio/workflow.py`: portfolio analysis entry point (LangGraph `StateGraph`)
 - `src/agents/portfolio/subagents/`: 7 pipeline nodes (portfolio, risk, market, news, decision, critic, formatter)
-- `src/agents/portfolio/tools/`: live data tools (yfinance, VADER), scoring, rebalance logic, and mock positions
+- `src/agents/portfolio/tools/`: live data tools (yfinance, VADER, news score), scoring, rebalance logic, and mock positions
 - `src/agents/portfolio/state/`: `PortfolioState` dataclass
 - `src/requirements.txt`: Python dependencies
 
@@ -62,10 +62,17 @@ python -m src.agents.portfolio.workflow
 
 # Skip NewsAgent
 python -m src.agents.portfolio.workflow --no-news
+
+# Select LLM provider and model
+python -m src.agents.portfolio.workflow --provider openai --model gpt-4-turbo
+python -m src.agents.portfolio.workflow --provider google --model gemini-pro
+python -m src.agents.portfolio.workflow --provider ollama --model llama3
 ```
 
-Set `PORTFOLIO_LLM_PROVIDER` to `ollama` (default), `openai`, or `google` to
-select the LLM used by `DecisionAgent`.
+Use `--provider` (choices: `ollama`, `openai`, `google`) and `--model` to select
+the LLM at runtime. Both flags default to the current `PORTFOLIO_LLM_PROVIDER` /
+`PORTFOLIO_LLM_MODEL` env vars, falling back to `ollama` / provider default.
+Unknown providers are rejected at startup with a clear error message.
 
 See [src/agents/portfolio/README.md](src/agents/portfolio/README.md) for the full portfolio documentation.
 
@@ -78,6 +85,7 @@ See [src/agents/portfolio/README.md](src/agents/portfolio/README.md) for the ful
 - LangChain OpenAI integration
 - LangChain Google Generative AI integration
 - TraceLoop SDK
+- feedparser (RSS news fallback)
 
 ## Current Agent Example
 

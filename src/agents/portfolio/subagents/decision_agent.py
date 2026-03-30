@@ -13,6 +13,7 @@ from src.agents.portfolio.state import PortfolioState
 from src.agents.portfolio.tools.validation import validate_decision
 from src.agents.portfolio.tools.scoring import score_stock
 from src.agents.portfolio.tools.rebalance_tools import compute_portfolio_action
+from src.agents.portfolio.tools.news_tools import compute_news_score
 from src.observability import get_telemetry_logger
 from src.llm import get_llm
 
@@ -542,7 +543,8 @@ class DecisionAgent:
         for ticker, insight in state.stock_insights.items():
             news        = state.news.get(ticker, [])
             gain_pct    = ((insight["price"] - insight["avg_cost"]) / insight["avg_cost"]) * 100
-            quant_score = score_stock(insight, gain_pct, horizon_years=horizon_years)
+            news_score  = compute_news_score(news)
+            quant_score = score_stock(insight, gain_pct, horizon_years=horizon_years, news_score=news_score)
             allocation_pct = stock_allocation.get(ticker)
             per_ticker_feedback = state.critic_feedback.get("per_ticker", {})
             critic_issues: Optional[List[str]] = (
