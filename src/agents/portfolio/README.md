@@ -334,13 +334,35 @@ Each entry in `state.decisions[ticker]`:
 
 #### Allocation change
 
-`allocation_change` is a signed percentage string giving the recommended
-change to the position's allocation weight. It is determined by a combination
-of LLM reasoning and deterministic post-process rules:
+`allocation_change` is **fully deterministic** — computed from the quant score
+and the position's current portfolio weight. The LLM's suggested value is
+discarded after parsing.
 
-- `EXIT` → always `-100%`; `HOLD` → always `0%` (overridden in code)
-- `REDUCE`: clamped to `[-50%, -5%]` — score -1 → ~`-10%`; score ≤-3 → `~-30%` to `-50%`
-- `DOUBLE_DOWN`: clamped to `[+5%, +20%]` — score +2 → `+5%`; score ≥4 → `+15%`
+| Action        | Rule                                                                  |
+| ------------- | --------------------------------------------------------------------- |
+| `EXIT`        | Always `-100%`                                                        |
+| `HOLD`        | Always `0%`                                                           |
+| `REDUCE`      | Base from score + concentration penalty (see below), capped at `-70%` |
+| `DOUBLE_DOWN` | From score only: score `+2` → `+10%`; score `≥+3` → `+20%`            |
+
+**REDUCE base by score:**
+
+| Score  | Base   |
+| ------ | ------ |
+| `-1`   | `-15%` |
+| `-2`   | `-30%` |
+| `≤ -3` | `-45%` |
+
+**Concentration penalty (added on top of base):**
+
+| Position weight | Extra trim |
+| --------------- | ---------- |
+| > 30 %          | `−15 %`    |
+| > 20 %          | `−10 %`    |
+| > 10 %          | `−5 %`     |
+
+**Example:** MSFT with score `+1`, action `REDUCE` (due to 39.6 % weight),
+base = `−15%`, penalty = `−15%` → always `−30%`. Identical across every run.
 
 #### DOUBLE_DOWN threshold
 
@@ -431,20 +453,41 @@ the known list) emit a warning but still proceed.
 
 **File:** `subagents/critic_agent.py`
 
-Validates the quality and consistency of decisions produced by `DecisionAgent`.
+Two-stage validation of decisions produced by `DecisionAgent`.
 Does **not** change any decisions — only annotates `critic_feedback`.
 
-| Reads             | Writes                  |
-| ----------------- | ----------------------- |
-| `state.decisions` | `state.critic_feedback` |
+| Reads                                   | Writes                  |
+| --------------------------------------- | ----------------------- |
+| `state.decisions`, `state.user_profile` | `state.critic_feedback` |
 
-**Checks performed:**
+#### Stage 1 — Hardcoded rules (always runs)
 
 | Check                   | Threshold                                      | Effect                                     |
 | ----------------------- | ---------------------------------------------- | ------------------------------------------ |
 | High exit/reduce rate   | > 50 % of positions are `EXIT` or `REDUCE`     | Adds portfolio-level warning               |
 | Low-confidence decision | `confidence == "low"`                          | Sets `approved = False`, flags ticker      |
 | Risky double-down       | `action == DOUBLE_DOWN` and `gain_pct < −20 %` | Adds portfolio-level warning, flags ticker |
+
+#### Stage 2 — LLM qualitative critique (only when Stage 1 passes)
+
+A single portfolio-level LLM call — **one call for all tickers** — that checks:
+
+1. **Overreaction to news** — is a REDUCE/EXIT driven purely by short-term headlines with no fundamental backing?
+2. **Quant score alignment** — does the action contradict the score direction without a stated reason?
+3. **Risk/reward coherence** — does the overall mix suit the investor's risk level and horizon?
+4. **Internal inconsistency** — conflicting decisions on correlated tickers without explanation.
+
+The LLM for the critic can be a **different model** from the decision agent to
+avoid self-review bias:
+
+```powershell
+$env:PORTFOLIO_CRITIC_LLM_PROVIDER = "openai"
+$env:PORTFOLIO_CRITIC_LLM_MODEL    = "gpt-4o"
+```
+
+When unset, falls back to `PORTFOLIO_LLM_PROVIDER` / `PORTFOLIO_LLM_MODEL`.
+LLM failures silently fall back to `approved = True` — hardcoded rules still
+apply regardless.
 
 `state.critic_feedback` structure:
 
@@ -455,7 +498,7 @@ Does **not** change any decisions — only annotates `critic_feedback`.
     "per_ticker": {
         ticker: {
             "status": "ok" | "flagged",
-            "issues": [str, ...],
+            "issues": [str, ...],     # stage-1 or "[LLM critic] ..." prefixed
         }
     }
 }

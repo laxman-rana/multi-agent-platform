@@ -63,18 +63,23 @@ class LLMProvider(ABC):
     """Abstract base class for LLM providers."""
 
     @abstractmethod
-    def get_llm(self, tools=None, callbacks=None):
-        """Return the configured LLM, optionally bound to tools and callbacks."""
+    def get_llm(self, tools=None, callbacks=None, model: str | None = None):
+        """Return the configured LLM, optionally bound to tools and callbacks.
+
+        Args:
+            model: explicit model name override; when None the provider reads
+                   from the PORTFOLIO_LLM_MODEL env var (or its built-in default).
+        """
         raise NotImplementedError
 
 
 class OllamaProvider(LLMProvider):
     """Provider for Ollama-hosted models."""
 
-    def get_llm(self, tools=None, callbacks=None):
+    def get_llm(self, tools=None, callbacks=None, model: str | None = None):
         from langchain_ollama import ChatOllama
 
-        model = os.getenv("PORTFOLIO_LLM_MODEL", _DEFAULT_MODELS["ollama"])
+        model = model or os.getenv("PORTFOLIO_LLM_MODEL", _DEFAULT_MODELS["ollama"])
         llm = ChatOllama(
             model=model,
             temperature=0,
@@ -91,10 +96,10 @@ class OllamaProvider(LLMProvider):
 class OpenAIProvider(LLMProvider):
     """Provider for OpenAI models."""
 
-    def get_llm(self, tools=None, callbacks=None):
+    def get_llm(self, tools=None, callbacks=None, model: str | None = None):
         from langchain_openai import ChatOpenAI
 
-        model = os.getenv("PORTFOLIO_LLM_MODEL", _DEFAULT_MODELS["openai"])
+        model = model or os.getenv("PORTFOLIO_LLM_MODEL", _DEFAULT_MODELS["openai"])
         llm = ChatOpenAI(model=model, temperature=0.7, callbacks=callbacks)
         if tools:
             llm = llm.bind_tools(tools)
@@ -104,10 +109,10 @@ class OpenAIProvider(LLMProvider):
 class GoogleProvider(LLMProvider):
     """Provider for Google Gemini models."""
 
-    def get_llm(self, tools=None, callbacks=None):
+    def get_llm(self, tools=None, callbacks=None, model: str | None = None):
         from langchain_google_genai import ChatGoogleGenerativeAI
 
-        model = os.getenv("PORTFOLIO_LLM_MODEL", _DEFAULT_MODELS["google"])
+        model = model or os.getenv("PORTFOLIO_LLM_MODEL", _DEFAULT_MODELS["google"])
         llm = ChatGoogleGenerativeAI(model=model, temperature=0.7, callbacks=callbacks)
         if tools:
             llm = llm.bind_tools(tools)
@@ -134,8 +139,12 @@ def get_provider(model_name="ollama"):
     return provider_class()
 
 
-def get_llm(model_name="ollama", tools=None, callbacks=None):
-    """Return a configured LLM from the selected provider."""
+def get_llm(model_name="ollama", tools=None, callbacks=None, model: str | None = None):
+    """Return a configured LLM from the selected provider.
 
+    Args:
+        model_name: provider key ("ollama", "openai", "google").
+        model:      explicit LLM model name; overrides PORTFOLIO_LLM_MODEL env var.
+    """
     provider = get_provider(model_name)
-    return provider.get_llm(tools=tools, callbacks=callbacks)
+    return provider.get_llm(tools=tools, callbacks=callbacks, model=model)

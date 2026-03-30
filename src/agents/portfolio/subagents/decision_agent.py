@@ -441,15 +441,47 @@ def _apply_action_floor(result: Dict[str, Any], quant_score: Dict[str, Any]) -> 
     return result
 
 
-def _apply_allocation_change(result: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Enforce deterministic allocation bounds post-parse.
+# ---------------------------------------------------------------------------
+# Score → allocation change lookup tables (deterministic, no LLM involvement)
+# ---------------------------------------------------------------------------
+_REDUCE_BASE: Dict[int, int] = {
+    -1: -15,
+    -2: -30,
+}  # scores ≤ -3 default to -45
 
-    - EXIT  → always "-100%" (LLM must not partial-exit)
-    - HOLD  → always "0%"
-    - REDUCE / DOUBLE_DOWN → clamp to safe ranges to prevent extreme LLM output
+_DD_BASE: Dict[int, int] = {
+    2: 10,
+}  # scores ≥ 3 default to +20
+
+# Extra trim applied when position weight exceeds these thresholds
+_WEIGHT_PENALTY: list = [
+    (30.0, -15),  # weight > 30% → extra -15%
+    (20.0, -10),  # weight > 20% → extra -10%
+    (10.0, -5),   # weight > 10% → extra -5%
+]
+
+
+def _apply_allocation_change(
+    result: Dict[str, Any],
+    quant_score: Dict[str, Any],
+    weight_pct: float,
+) -> Dict[str, Any]:
+    """
+    Compute a fully deterministic allocation_change from the quant score and
+    current portfolio weight. The LLM's suggested value is discarded entirely.
+
+    Rules:
+      EXIT        → "-100%" always
+      HOLD        → "0%" always
+      REDUCE      → base from score, plus concentration penalty by weight:
+                      score -1 → -15%  |  score -2 → -30%  |  score ≤-3 → -45%
+                      weight >30% → -15 extra  |  >20% → -10 extra  |  >10% → -5 extra
+                      capped at -70% total
+      DOUBLE_DOWN → base from score:
+                      score 2 → +10%  |  score ≥3 → +20%
     """
     action = result["action"]
+
     if action == "EXIT":
         result["allocation_change"] = "-100%"
         return result
@@ -457,19 +489,22 @@ def _apply_allocation_change(result: Dict[str, Any]) -> Dict[str, Any]:
         result["allocation_change"] = "0%"
         return result
 
-    raw = result.get("allocation_change", "0%")
-    # Parse the numeric part (strip leading sign and trailing %)
-    try:
-        numeric = float(raw.replace("%", "").replace("+", ""))
-    except ValueError:
-        numeric = 0.0
+    score = quant_score.get("score", 0)
 
     if action == "REDUCE":
-        # Must be negative; clamp to [-50, -5]
-        numeric = max(-50.0, min(-5.0, -abs(numeric)))
+        base = _REDUCE_BASE.get(score, -45)  # score ≤ -3 → -45
+        penalty = 0
+        for threshold, extra in _WEIGHT_PENALTY:
+            if weight_pct > threshold:
+                penalty = extra
+                break
+        numeric = max(-70, base + penalty)  # cap at -70%
+
     elif action == "DOUBLE_DOWN":
-        # Must be positive; clamp to [+5, +20]
-        numeric = max(5.0, min(20.0, abs(numeric)))
+        numeric = _DD_BASE.get(score, 20)  # score ≥ 3 → +20
+
+    else:
+        numeric = 0
 
     sign = "+" if numeric > 0 else ""
     result["allocation_change"] = f"{sign}{numeric:.0f}%"
@@ -655,7 +690,7 @@ class DecisionAgent:
             try:
                 result = _parse_llm_response(response.content, gain_pct)
                 result = _apply_action_floor(result, quant_score or {})
-                result = _apply_allocation_change(result)
+                result = _apply_allocation_change(result, quant_score or {}, stock_allocation_pct or 0.0)
                 result = _apply_score_confidence(result, quant_score or {})
                 valid, val_err = validate_decision(result)
                 if not valid:
