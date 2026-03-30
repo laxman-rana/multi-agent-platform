@@ -9,6 +9,10 @@ a structured trade-decision report. Agents are wired into a directed graph using
 ## Table of Contents
 
 - [Overview](#overview)
+- [Deterministic Layer](#deterministic-layer)
+- [LLM Layer](#llm-layer)
+- [Orchestration](#orchestration)
+- [Guardrails](#guardrails)
 - [Architecture](#architecture)
   - [Agent Graph](#agent-graph)
   - [Conditional Routing](#conditional-routing)
@@ -54,6 +58,154 @@ renders the final human-readable report.
 | Conditional logic   | Volatility-driven routing — skip or include `NewsAgent`                                     |
 | Real LLM decisions  | `DecisionAgent` calls `get_llm()` via `--provider` flag or `PORTFOLIO_LLM_PROVIDER` env var |
 | Live market data    | `market_tools` and `news_tools` fetch live data via `yfinance` + VADER + RSS fallback       |
+
+---
+
+## Deterministic Layer
+
+These components produce the same output every time for the same input.
+No LLM is involved. They are the foundation the LLM layer builds on top of.
+
+| Component                 | File                       | What it computes                                                                              |
+| ------------------------- | -------------------------- | --------------------------------------------------------------------------------------------- |
+| **Quantitative score**    | `tools/scoring.py`         | Integer score (−5 to +5) from P/E trend, 52-week range, gain/loss, volatility, news sentiment |
+| **News score**            | `tools/news_tools.py`      | Aggregates VADER-scored headlines → `−1 / 0 / +1` signal                                      |
+| **Risk metrics**          | `tools/risk_tools.py`      | Portfolio value, P&L, weighted volatility, sector breakdown, concentration label              |
+| **Portfolio action**      | `tools/rebalance_tools.py` | Sector overweight / diversification recommendation (threshold-based, no LLM)                  |
+| **Action floor**          | `decision_agent.py`        | Downgrades `DOUBLE_DOWN → HOLD` when score `< 2`                                              |
+| **Allocation sizing**     | `decision_agent.py`        | Computes `allocation_change` from score + weight formula; discards LLM value                  |
+| **Confidence override**   | `decision_agent.py`        | `abs(score) ≥ 2 → high`; `≤ 1 → moderate`; LLM value ignored                                  |
+| **Structural validation** | `tools/validation.py`      | Rejects malformed `action`, `confidence`, `reason`, `allocation_change` fields                |
+| **Stage-1 critic rules**  | `critic_agent.py`          | Low-confidence rejection, exit-rate flag, risky double-down flag                              |
+
+---
+
+## LLM Layer
+
+These components call the language model. Their output is **always
+post-processed by the deterministic layer** before being used.
+
+| Component                    | Agent                   | Role                                                                                                                         |
+| ---------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| **Per-ticker decision**      | `DecisionAgent`         | Chooses `action` and writes a human-readable `reason` given the quantitative score, market data, news, and portfolio context |
+| **Portfolio-level critique** | `CriticAgent` (Stage 2) | Reviews all decisions holistically — news overreaction, score alignment, risk coherence, cross-ticker inconsistency          |
+
+**Provider / model selection:**
+
+| Env var                         | CLI flag     | Purpose                                                   |
+| ------------------------------- | ------------ | --------------------------------------------------------- |
+| `PORTFOLIO_LLM_PROVIDER`        | `--provider` | Decision agent provider (`ollama` / `openai` / `google`)  |
+| `PORTFOLIO_LLM_MODEL`           | `--model`    | Decision agent model name                                 |
+| `PORTFOLIO_CRITIC_LLM_PROVIDER` | —            | Critic provider (defaults to decision provider)           |
+| `PORTFOLIO_CRITIC_LLM_MODEL`    | —            | Critic model (recommended: different from decision model) |
+
+**Execution:** all per-ticker LLM calls run concurrently via `ThreadPoolExecutor`
+(`max_workers = n_tickers`), reducing wall time from `n × ~5s` to `~5–8s`.
+
+---
+
+## Orchestration
+
+The workflow is a **directed acyclic graph** assembled with LangGraph
+`StateGraph`. All agents read from and write to a single `PortfolioState`
+object — no agent calls another agent directly.
+
+**Graph topology:**
+
+```
+PortfolioAgent → RiskAgent → MarketAgent
+                                  │
+                   volatility > 30%│         within threshold
+                                  ▼                  │
+                            NewsAgent ───────────────┤
+                                                     ▼
+                                            DecisionAgent
+                                                  │
+                                            CriticAgent
+                                         ╔══════╧══════╗
+                                  approved=True   approved=False
+                                         │              │
+                                  FormatterAgent   (retry loop, max 1)
+```
+
+**Conditional routing:**
+
+- `volatility_router()` runs after `MarketAgent`; routes to `NewsAgent` if any
+  ticker volatility > 30 %, otherwise straight to `DecisionAgent`.
+- `critic_router()` runs after `CriticAgent`; routes back to `DecisionAgent`
+  (with feedback injected) if `approved = False`, up to one retry.
+- `--no-news` flag bypasses the volatility conditional entirely.
+
+**Retry loop:** `critic_retry_count` in `PortfolioState` tracks retries;
+`workflow.py` caps it at 1 to prevent infinite cycles.
+
+---
+
+## Guardrails
+
+Every output the LLM produces is post-processed by a stack of deterministic
+rules before it reaches the user. These guardrails run **after** the LLM
+responds and override or reject its output entirely — the LLM never has the
+final word on safety-critical fields.
+
+### 1. Action floor — DOUBLE_DOWN requires score ≥ 2
+
+`_apply_action_floor()` in `decision_agent.py`:
+
+- If the LLM outputs `DOUBLE_DOWN` but the quant score is `< 2`, the action is
+  downgraded to `HOLD`, `allocation_change` is forced to `0%`, and a note is
+  prepended to the reason.
+- Prevents the LLM from aggressively adding to positions on a weak single-signal
+  conviction (`score = +1`).
+
+### 2. Deterministic allocation sizing (score + weight formula)
+
+`_apply_allocation_change()` in `decision_agent.py`:
+
+- `allocation_change` is **fully overwritten** after parsing — the LLM's
+  suggested number is always discarded.
+- `EXIT → -100%`, `HOLD → 0%` (hard overrides).
+- `REDUCE`: base from score (`-1→-15%`, `-2→-30%`, `≤-3→-45%`) plus
+  a concentration penalty (`>10%→-5`, `>20%→-10`, `>30%→-15`), capped at `-70%`.
+- `DOUBLE_DOWN`: `score +2 → +10%`, `score ≥+3 → +20%`.
+- Guarantees reproducible, identical allocation numbers across every run for
+  the same input data.
+
+### 3. Confidence calibration
+
+`_apply_score_confidence()` in `decision_agent.py`:
+
+- LLM-reported confidence is always overridden.
+- `abs(score) ≥ 2 → high`; `abs(score) ≤ 1 → moderate`.
+- Prevents the LLM from falsely claiming `high` confidence on weak signals.
+
+### 4. Structural validation
+
+`validate_decision()` in `tools/validation.py`:
+
+- Rejects any response where `action`, `confidence`, `reason`, or
+  `allocation_change` are missing or malformed.
+- On failure the LLM is shown its own bad output and retried once.
+
+### 5. Two-stage critic
+
+`CriticAgent` in `subagents/critic_agent.py`:
+
+- **Stage 1 (hardcoded):** rejects `low` confidence decisions; flags risky
+  `DOUBLE_DOWN` on >20% unrealised loss; warns on >50% exit/reduce rate.
+- **Stage 2 (LLM):** single portfolio-level call checking news overreaction,
+  quant score alignment, risk coherence, and cross-ticker inconsistency.
+  Optionally uses a **different model** than the decision agent to avoid
+  self-review bias (`PORTFOLIO_CRITIC_LLM_PROVIDER` / `PORTFOLIO_CRITIC_LLM_MODEL`).
+- Stage 2 failure is silent — Stage 1 rules always apply regardless.
+
+### 6. LLM JSON corruption guard
+
+- Each provider's `get_llm()` call uses `temperature=0` (Ollama) or low
+  temperature to reduce hallucination in structured output.
+- The JSON parser strips markdown fences before attempting `json.loads()`.
+- A single retry with the bad output appended to the conversation gives the
+  model a chance to self-correct before the call is abandoned.
 
 ---
 
