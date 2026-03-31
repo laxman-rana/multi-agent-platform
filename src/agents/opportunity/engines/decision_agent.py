@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 from functools import lru_cache
 from typing import Any, Dict, Optional
 
@@ -287,11 +288,24 @@ class OpportunityDecisionAgent:
             ticker, market_data, signal_result, opportunity_type, news_sentiment
         )
 
+        messages = [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=human_msg)]
         try:
-            llm      = _get_decision_llm()
-            response = llm.invoke(
-                [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=human_msg)]
-            )
+            llm = _get_decision_llm()
+            response = None
+            for _retry in range(3):
+                try:
+                    response = llm.invoke(messages)
+                    break
+                except Exception as exc:
+                    if "429" in str(exc) and _retry < 2:
+                        _wait = 2.0 * (2 ** _retry)  # 2s, then 4s
+                        logger.warning(
+                            "[OpportunityDecisionAgent] 429 rate-limit for %s — retry %d in %.0fs",
+                            ticker, _retry + 1, _wait,
+                        )
+                        time.sleep(_wait)
+                    else:
+                        raise
             raw    = response.content if hasattr(response, "content") else str(response)
             result = _parse_llm_response(raw)
         except Exception as exc:

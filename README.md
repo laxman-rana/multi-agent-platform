@@ -2,10 +2,11 @@
 
 This repository hosts multiple AI agents across different business domains. It provides a shared Python package layout for agent implementations, LLM providers, observability integrations, and agent-specific tools.
 
-Two agents are currently implemented:
+Three agents are currently implemented:
 
 - **E-commerce support agent** — LangGraph-based customer support workflow with tool-calling (refunds, messaging)
-- **Portfolio analysis agent** — LangGraph multi-agent pipeline that analyses an investor's equity portfolio using live market data (yfinance) and an LLM to produce hold/reduce/exit/double-down recommendations with actionable allocation changes
+- **Portfolio analysis agent** — LangGraph multi-agent pipeline that analyses an investor's equity portfolio using live market data and an LLM to produce hold/reduce/exit/double-down recommendations with actionable allocation changes
+- **Opportunity scanner agent** — 3-node LangGraph pipeline that scans live equity markets (US S&P 500, NIFTY 50/MIDCAP 100/SMALLCAP 100) for high-quality BUY entries using deterministic signals, news sentiment, analyst consensus, and volume pressure
 
 The goal is to use the same shared foundation for additional agents such as fulfillment, finance, operations, HR, or other domain-specific assistants.
 
@@ -44,7 +45,41 @@ Each agent package can define its own:
 - `src/agents/portfolio/subagents/`: 7 pipeline nodes (portfolio, risk, market, news, decision, critic, formatter)
 - `src/agents/portfolio/tools/`: live data tools (yfinance, VADER, news score), scoring, rebalance logic, and mock positions
 - `src/agents/portfolio/state/`: `PortfolioState` dataclass
+- `src/agents/opportunity/workflow.py`: opportunity scanner entry point (LangGraph 3-node graph + CLI)
+- `src/agents/opportunity/engines/`: PreFilterEngine, SignalEngine (8 signals), OpportunityDecisionAgent
+- `src/agents/opportunity/nodes/`: AlphaScannerAgent, NewsNode, DecisionNode
+- `src/agents/opportunity/markets/`: MarketStrategy (US, IN, IN_MID, IN_SMALL)
+- `src/agents/opportunity/state.py`: `OpportunityState` dataclass
 - `src/requirements.txt`: Python dependencies
+
+## Quick Start
+
+```powershell
+# ── E-commerce support ────────────────────────────────────────────────────
+python -m src.agents.ecommerce.support.agent
+
+# ── Portfolio analysis ────────────────────────────────────────────────────
+python -m src.agents.portfolio.workflow                        # default (Ollama)
+python -m src.agents.portfolio.workflow --no-news              # skip NewsAgent
+python -m src.agents.portfolio.workflow --model gpt-4o         # OpenAI
+python -m src.agents.portfolio.workflow --model gemini-1.5-pro # Google
+
+# ── Opportunity scanner — single scan ─────────────────────────────────────
+python -m src.agents.opportunity.workflow --top-n 50 --once            # US S&P 500 top 50
+python -m src.agents.opportunity.workflow --tickers AAPL MSFT NVDA --once  # explicit tickers
+python -m src.agents.opportunity.workflow --top-n 50 --market IN --once    # NIFTY 50
+python -m src.agents.opportunity.workflow --top-n 100 --market IN_MID --once   # NIFTY MIDCAP 100
+python -m src.agents.opportunity.workflow --top-n 100 --market IN_SMALL --once # NIFTY SMALLCAP 100
+
+# ── Opportunity scanner — continuous (runs while market is open) ───────────
+python -m src.agents.opportunity.workflow --top-n 100                  # every 15 min
+python -m src.agents.opportunity.workflow --top-n 100 --interval 5     # every 5 min
+python -m src.agents.opportunity.workflow --top-n 50 --market IN --interval 10
+```
+
+All agents accept `--model <name>` to switch the LLM — the provider is inferred automatically from the model name.
+
+---
 
 ## Running the Agents
 
@@ -69,13 +104,34 @@ python -m src.agents.portfolio.workflow --model gemini-pro
 python -m src.agents.portfolio.workflow --model llama3
 ```
 
-Use `--model` to select the LLM at runtime. The provider is **inferred
-automatically** from the model name. Unknown models fail fast at startup with a
-clear error listing all known models across every provider.
-For custom/fine-tuned models, set `PORTFOLIO_LLM_PROVIDER` as an explicit
-override (env var only — no CLI flag).
+See [src/agents/portfolio/README.md](src/agents/portfolio/README.md) for full documentation.
 
-See [src/agents/portfolio/README.md](src/agents/portfolio/README.md) for the full portfolio documentation.
+### Opportunity scanner agent
+
+| Flag         | Type    | Description                                                 |
+| ------------ | ------- | ----------------------------------------------------------- |
+| `--tickers`  | `str …` | Explicit list of ticker symbols to scan                     |
+| `--top-n`    | `int`   | Scan top-N most liquid tickers from the built-in universe   |
+| `--market`   | `str`   | Market universe: `US` (default), `IN`, `IN_MID`, `IN_SMALL` |
+| `--interval` | `int`   | Minutes between scans in continuous mode (default: 15)      |
+| `--once`     | flag    | Run a single scan and exit instead of looping               |
+| `--model`    | `str`   | Override the LLM model (provider auto-inferred)             |
+| `--verbose`  | flag    | Print per-ticker prefilter debug output                     |
+
+Either `--tickers` or `--top-n` is required. `--once` is recommended outside market hours.
+
+```powershell
+# Single scan — US large cap
+python -m src.agents.opportunity.workflow --top-n 50 --once
+
+# Single scan — Indian mid cap, OpenAI model
+python -m src.agents.opportunity.workflow --top-n 100 --market IN_MID --model gpt-4o --once
+
+# Continuous scan — US, every 10 minutes
+python -m src.agents.opportunity.workflow --top-n 200 --interval 10
+```
+
+See [src/agents/opportunity/README.md](src/agents/opportunity/README.md) for full documentation.
 
 ## Technologies Used
 

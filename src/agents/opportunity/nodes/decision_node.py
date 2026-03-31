@@ -19,6 +19,7 @@ State contract
 """
 
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -27,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from src.agents.opportunity.nodes.alpha_scanner_agent import _MAX_SECTOR_EXPOSURE, _MAX_POSITION_WEIGHT
 from src.agents.opportunity.engines.decision_agent import OpportunityDecisionAgent
 from src.agents.opportunity.state import OpportunityState
+from src.llm import get_provider, infer_provider
 from src.observability import get_telemetry_logger
 
 logger = logging.getLogger(__name__)
@@ -91,7 +93,18 @@ class DecisionNode:
             self._decision_cache[key] = (dec, time.monotonic())
             return tkr, dec, lat
 
-        n_workers = min(len(approved_candidates), _MAX_LLM_WORKERS) or 1
+        _provider_name = os.getenv("PORTFOLIO_LLM_PROVIDER", "ollama")
+        _model = os.getenv("ALPHA_SCANNER_LLM_MODEL") or os.getenv("PORTFOLIO_LLM_MODEL")
+        if _model:
+            try:
+                _provider_name = infer_provider(_model)
+            except ValueError:
+                pass
+        n_workers = min(
+            len(approved_candidates),
+            get_provider(_provider_name).max_concurrency,
+            _MAX_LLM_WORKERS,
+        ) or 1
         raw_decisions: Dict[str, Tuple[Dict[str, Any], float]] = {}
 
         _t = time.monotonic()

@@ -534,12 +534,15 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--market",
-        choices=["US", "IN"],
+        choices=["US", "IN", "IN_MID", "IN_SMALL"],
         default="US",
         metavar="MARKET",
         help=(
-            "Market to scan: 'US' for S&P 500 / NYSE (default), "
-            "'IN' for NIFTY 50 / NSE.  "
+            "Market universe to scan (default: 'US'). "
+            "'US' = S&P 500 / NYSE, "
+            "'IN' = NIFTY 50 / NSE, "
+            "'IN_MID' = NIFTY MIDCAP 100 / NSE, "
+            "'IN_SMALL' = NIFTY SMALLCAP 100 / NSE.  "
             "Applies to --top-n universe selection and market-hours check."
         ),
     )

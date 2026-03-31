@@ -17,6 +17,7 @@ State contract
 import json
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
@@ -95,9 +96,22 @@ def _summarise_news(ticker: str, headlines: List[str]) -> Dict[str, Any]:
     )
     try:
         llm      = _get_news_llm()
-        response = llm.invoke(
-            [SystemMessage(content=_NEWS_SYSTEM_PROMPT), HumanMessage(content=human_text)]
-        )
+        messages = [SystemMessage(content=_NEWS_SYSTEM_PROMPT), HumanMessage(content=human_text)]
+        response = None
+        for _retry in range(3):
+            try:
+                response = llm.invoke(messages)
+                break
+            except Exception as exc:
+                if "429" in str(exc) and _retry < 2:
+                    _wait = 2.0 * (2 ** _retry)
+                    logger.warning(
+                        "[NewsNode] 429 rate-limit for %s — retry %d in %.0fs",
+                        ticker, _retry + 1, _wait,
+                    )
+                    time.sleep(_wait)
+                else:
+                    raise
         raw = response.content.strip()
         if raw.startswith("```"):
             parts = raw.split("```")

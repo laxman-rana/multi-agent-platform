@@ -45,8 +45,9 @@ PortfolioAgent + MarketAgent + RiskAgent   (auto-fetched on startup)
         │
         │  position_weights, sector_allocation, cash_available
         ▼
-Watchlist (explicit --tickers  OR  get_liquid_universe(--top-n))
-        │  Up to 500 S&P 500 / NIFTY 50 constituents available
+Watchlist (explicit --tickers  OR  get_liquid_universe(--top-n, market))
+        │  US: up to 500 S&P 500 constituents
+        │  IN / IN_MID / IN_SMALL: NIFTY 50 / MIDCAP 100 / SMALLCAP 100
         │
         ▼  ──────────────────────────────────────────────────────────────────
         │                      [scanner node]
@@ -97,7 +98,11 @@ src/agents/opportunity/
 │   └── decision_node.py       DecisionNode      — stages 7-9 (LLM + sort)
 └── markets/
     ├── __init__.py
-    └── market_strategy.py     MarketStrategy ABC + USMarketStrategy / INMarketStrategy
+    └── market_strategy.py     MarketStrategy ABC → _NSEMarketStrategy
+                               → USMarketStrategy (US)
+                               → INMarketStrategy (IN)
+                               → INMidCapStrategy (IN_MID)
+                               → INSmallCapStrategy (IN_SMALL)
 ```
 
 ---
@@ -110,21 +115,21 @@ src/agents/opportunity/
 
 All tickers in the watchlist are fetched **in parallel** using `ThreadPoolExecutor` (up to `_MAX_FETCH_WORKERS` = 10 concurrent threads). Each fetch makes a single `yf.Ticker(ticker).info` call and returns:
 
-| Field             | Source                                                     |
-| ----------------- | ---------------------------------------------------------- |
-| `price`           | `currentPrice` / `regularMarketPrice` / `previousClose`    |
-| `change_pct`      | Computed from `regularMarketPreviousClose`                 |
-| `volatility`      | Annualised std dev from 30-day daily returns               |
-| `pe_ratio`        | `trailingPE`                                               |
-| `forward_pe`      | `forwardPE`                                                |
-| `52w_high/low`    | `fiftyTwoWeekHigh` / `fiftyTwoWeekLow`                     |
-| `sector`          | `info["sector"]` (used for portfolio guardrails)           |
-| `volume`          | `regularMarketVolume`                                      |
-| `avg_volume`      | `averageVolume` (30-day average)                           |
-| `analyst_rating`  | `recommendationKey` (e.g. `"buy"`, `"hold"`, `"sell"`)     |
-| `analyst_count`   | `numberOfAnalystOpinions`                                  |
-| `analyst_target`  | `targetMeanPrice` — mean analyst price target (float)      |
-| `vol_pressure`    | Derived: `"buying"` / `"selling"` / `"neutral"` (see below)|
+| Field            | Source                                                      |
+| ---------------- | ----------------------------------------------------------- |
+| `price`          | `currentPrice` / `regularMarketPrice` / `previousClose`     |
+| `change_pct`     | Computed from `regularMarketPreviousClose`                  |
+| `volatility`     | Annualised std dev from 30-day daily returns                |
+| `pe_ratio`       | `trailingPE`                                                |
+| `forward_pe`     | `forwardPE`                                                 |
+| `52w_high/low`   | `fiftyTwoWeekHigh` / `fiftyTwoWeekLow`                      |
+| `sector`         | `info["sector"]` (used for portfolio guardrails)            |
+| `volume`         | `regularMarketVolume`                                       |
+| `avg_volume`     | `averageVolume` (30-day average)                            |
+| `analyst_rating` | `recommendationKey` (e.g. `"buy"`, `"hold"`, `"sell"`)      |
+| `analyst_count`  | `numberOfAnalystOpinions`                                   |
+| `analyst_target` | `targetMeanPrice` — mean analyst price target (float)       |
+| `vol_pressure`   | Derived: `"buying"` / `"selling"` / `"neutral"` (see below) |
 
 **Volume pressure proxy**
 
@@ -163,16 +168,16 @@ A ticker with no price data is unconditionally rejected. All thresholds are defi
 
 Deterministic quantitative scoring applied to every ticker that passed the prefilter. Eight signals fire independently using a configurable `_WEIGHTS` dict; their points are summed into a final score.
 
-| Signal                    | Condition                                          | Weight | Rationale                                         |
-| ------------------------- | -------------------------------------------------- | ------ | ------------------------------------------------- |
-| `pe_improvement`          | `forward_pe < pe_ratio`                            | **+1** | Earnings growth expected — valuation improving    |
-| `52w_lower_band`          | Price in lower 30% of 52w range                    | **+1** | Potential value-entry zone                        |
-| `analyst_bullish`         | `buy`/`strong_buy`, ≥ 3 analysts, > 5% target upside | **+1** | Wall Street consensus supports new entry       |
-| `buying_pressure`         | price up + volume ≥ 1.5× avg                       | **+1** | Institutional accumulation proxy                 |
-| `near_52w_high`           | Price within 5% of 52w high                        | **−1** | Chasing strength — unfavourable entry risk/reward |
-| `analyst_bearish`         | `underperform`/`sell`, ≥ 3 analysts                | **−1** | Professional consensus against new entry         |
-| `selling_pressure`        | price down + volume ≥ 1.5× avg                     | **−1** | Distribution / institutional exit proxy          |
-| `volatility`              | `volatility > 35%`                                 | **−2** | High vol cancels two bullish signals              |
+| Signal             | Condition                                            | Weight | Rationale                                         |
+| ------------------ | ---------------------------------------------------- | ------ | ------------------------------------------------- |
+| `pe_improvement`   | `forward_pe < pe_ratio`                              | **+1** | Earnings growth expected — valuation improving    |
+| `52w_lower_band`   | Price in lower 30% of 52w range                      | **+1** | Potential value-entry zone                        |
+| `analyst_bullish`  | `buy`/`strong_buy`, ≥ 3 analysts, > 5% target upside | **+1** | Wall Street consensus supports new entry          |
+| `buying_pressure`  | price up + volume ≥ 1.5× avg                         | **+1** | Institutional accumulation proxy                  |
+| `near_52w_high`    | Price within 5% of 52w high                          | **−1** | Chasing strength — unfavourable entry risk/reward |
+| `analyst_bearish`  | `underperform`/`sell`, ≥ 3 analysts                  | **−1** | Professional consensus against new entry          |
+| `selling_pressure` | price down + volume ≥ 1.5× avg                       | **−1** | Distribution / institutional exit proxy           |
+| `volatility`       | `volatility > 35%`                                   | **−2** | High vol cancels two bullish signals              |
 
 > **Why −2 for volatility?** A weight of −1 was insufficient — a ticker with PE improvement (+1) and lower-band (+1) scoring +1 despite dangerous volatility would still advance. At −2 the net score is 0 (neutral) and the ticker does not pass the candidate filter.
 
@@ -254,7 +259,7 @@ All other cap checks surface as **warnings in the output** rather than silently 
 | Condition                                     | Severity | Warning label           |
 | --------------------------------------------- | -------- | ----------------------- |
 | `position > _MAX_POSITION_WEIGHT` (10%)       | ⚠️       | `POSITION CAP EXCEEDED` |
-| `position > _MAX_POSITION_WEIGHT × 0.8` (8%) | ⚠️       | `CONCENTRATION RISK`    |
+| `position > _MAX_POSITION_WEIGHT × 0.8` (8%)  | ⚠️       | `CONCENTRATION RISK`    |
 | `sector_alloc > _MAX_SECTOR_EXPOSURE` (60%)`  | ⚠️       | `SECTOR CAP EXCEEDED`   |
 | `sector_alloc > _SECTOR_TARGET_WEIGHT` (20%)` | ⚠️       | `SECTOR OVERWEIGHT`     |
 
@@ -294,17 +299,17 @@ A dedicated LangGraph node that runs **after** candidates are filtered and **bef
 
 A per-ticker LLM call that produces a structured `BUY` or `IGNORE` verdict. The LLM receives four enriched context blocks:
 
-| Context block       | Source                                      |
-| ------------------- | ------------------------------------------- |
-| Quantitative score  | SignalEngine — score, tier, fired signals   |
-| Market data         | `_fetch_extended` — price, PE, vol, 52w     |
-| Analyst consensus   | `analyst_rating`, `analyst_count`, `analyst_target` |
-| Volume pressure     | `vol_pressure` — `BUYING / SELLING / NEUTRAL` |
-| News sentiment      | `NewsNode` — `POSITIVE / NEUTRAL / NEGATIVE` + catalyst |
+| Context block      | Source                                                  |
+| ------------------ | ------------------------------------------------------- |
+| Quantitative score | SignalEngine — score, tier, fired signals               |
+| Market data        | `_fetch_extended` — price, PE, vol, 52w                 |
+| Analyst consensus  | `analyst_rating`, `analyst_count`, `analyst_target`     |
+| Volume pressure    | `vol_pressure` — `BUYING / SELLING / NEUTRAL`           |
+| News sentiment     | `NewsNode` — `POSITIVE / NEUTRAL / NEGATIVE` + catalyst |
 
 **Parallelisation and caching** (in `DecisionNode`):
 
-All candidates are dispatched concurrently using `ThreadPoolExecutor` (up to `_MAX_LLM_WORKERS` = 5). An **instance-level short-TTL cache** avoids redundant LLM round-trips:
+All candidates are dispatched concurrently using `ThreadPoolExecutor`, capped by `min(candidates, provider.max_concurrency, _MAX_LLM_WORKERS)`. For Ollama this resolves to 1 (sequential); for cloud providers it runs up to 5 in parallel. An **instance-level short-TTL cache** avoids redundant LLM round-trips:
 
 - **Cache key:** `"{ticker}:{score}:{type}"`
 - **TTL:** `_DECISION_CACHE_TTL_MINUTES` (default: 15 minutes)
@@ -361,19 +366,19 @@ The raw `score` in the output always reflects quantitative signals only.
 
 All pipeline stages read from and write to a single shared state object.
 
-| Field               | Type              | Written by     | Description                                            |
-| ------------------- | ----------------- | -------------- | ------------------------------------------------------ |
-| `watchlist`         | `List[str]`       | caller         | Input tickers for this scan cycle                      |
-| `portfolio_context` | `Dict[str, Any]`  | caller / auto  | Guardrail data (see schema below)                      |
-| `market_data`       | `Dict[str, Dict]` | `scanner`      | Extended market data per ticker                        |
-| `prefiltered`       | `List[str]`       | `scanner`      | Tickers that passed PreFilterEngine                    |
-| `signals`           | `Dict[str, Dict]` | `scanner`      | SignalEngine output per ticker                         |
-| `candidates`        | `List[str]`       | `scanner`      | Score ≥ 1 + cooldown clear                             |
-| `news_sentiment`    | `Dict[str, Dict]` | `news`         | `{ticker: {sentiment, catalyst, headline_count}}`      |
-| `decisions`         | `Dict[str, Dict]` | `decision`     | LLM output per candidate                               |
-| `buy_opportunities` | `List[Dict]`      | `decision`     | Final sorted BUY list                                  |
-| `scan_errors`       | `Dict[str, str]`  | `scanner`      | Fetch failures: ticker → error message                 |
-| `recent_signals`    | `Dict[str, str]`  | `decision`     | Cooldown tracker: ticker → last BUY ISO UTC timestamp  |
+| Field               | Type              | Written by    | Description                                           |
+| ------------------- | ----------------- | ------------- | ----------------------------------------------------- |
+| `watchlist`         | `List[str]`       | caller        | Input tickers for this scan cycle                     |
+| `portfolio_context` | `Dict[str, Any]`  | caller / auto | Guardrail data (see schema below)                     |
+| `market_data`       | `Dict[str, Dict]` | `scanner`     | Extended market data per ticker                       |
+| `prefiltered`       | `List[str]`       | `scanner`     | Tickers that passed PreFilterEngine                   |
+| `signals`           | `Dict[str, Dict]` | `scanner`     | SignalEngine output per ticker                        |
+| `candidates`        | `List[str]`       | `scanner`     | Score ≥ 1 + cooldown clear                            |
+| `news_sentiment`    | `Dict[str, Dict]` | `news`        | `{ticker: {sentiment, catalyst, headline_count}}`     |
+| `decisions`         | `Dict[str, Dict]` | `decision`    | LLM output per candidate                              |
+| `buy_opportunities` | `List[Dict]`      | `decision`    | Final sorted BUY list                                 |
+| `scan_errors`       | `Dict[str, str]`  | `scanner`     | Fetch failures: ticker → error message                |
+| `recent_signals`    | `Dict[str, str]`  | `decision`    | Cooldown tracker: ticker → last BUY ISO UTC timestamp |
 
 ### `portfolio_context` schema
 
@@ -430,20 +435,20 @@ The final `buy_opportunities` list is sorted by confidence then effective score 
 
 Each BUY entry carries `portfolio_warnings` and `portfolio_hints`. All 12 scenarios:
 
-| Scenario                     | Condition                                        | Output type | Label                         |
-| ---------------------------- | ------------------------------------------------ | ----------- | ----------------------------- |
-| Position cap exceeded        | `current_position > _MAX_POSITION_WEIGHT` (10%)  | ⚠️ warning  | `POSITION CAP EXCEEDED`       |
-| Approaching position cap     | `current_position > 8%`                          | ⚠️ warning  | `CONCENTRATION RISK`          |
-| Existing position within cap | `current_position > 0` and ≤ 8%                  | ℹ️ hint     | current position info         |
-| New position                 | `current_position == 0`                          | ✓ hint      | `NEW POSITION`                |
-| Sector hard cap exceeded     | `sector_alloc > _MAX_SECTOR_EXPOSURE` (60%)      | ⚠️ warning  | `SECTOR CAP EXCEEDED`         |
-| Sector overweight            | `sector_alloc > _SECTOR_TARGET_WEIGHT` (20%)     | ⚠️ warning  | `SECTOR OVERWEIGHT`           |
-| Sector underweight           | gap > 5% below target                            | ✓ hint      | `DIVERSIFICATION OPPORTUNITY` |
-| Sector neutral               | within 5% of target                              | ℹ️ hint     | `SECTOR FIT`                  |
-| Limited capital              | `cash_pct < 10%`                                 | ⚠️ warning  | `LIMITED CAPITAL`             |
-| Tight capital                | `cash_pct 10–25%`                                | ℹ️ hint     | `TIGHT CAPITAL`               |
-| Capital available            | `cash_pct > 25%`                                 | ✓ hint      | `CAPITAL AVAILABLE`           |
-| Unlimited capital            | `cash_available == inf`                          | ✓ hint      | `UNLIMITED CAPITAL`           |
+| Scenario                     | Condition                                       | Output type | Label                         |
+| ---------------------------- | ----------------------------------------------- | ----------- | ----------------------------- |
+| Position cap exceeded        | `current_position > _MAX_POSITION_WEIGHT` (10%) | ⚠️ warning  | `POSITION CAP EXCEEDED`       |
+| Approaching position cap     | `current_position > 8%`                         | ⚠️ warning  | `CONCENTRATION RISK`          |
+| Existing position within cap | `current_position > 0` and ≤ 8%                 | ℹ️ hint     | current position info         |
+| New position                 | `current_position == 0`                         | ✓ hint      | `NEW POSITION`                |
+| Sector hard cap exceeded     | `sector_alloc > _MAX_SECTOR_EXPOSURE` (60%)     | ⚠️ warning  | `SECTOR CAP EXCEEDED`         |
+| Sector overweight            | `sector_alloc > _SECTOR_TARGET_WEIGHT` (20%)    | ⚠️ warning  | `SECTOR OVERWEIGHT`           |
+| Sector underweight           | gap > 5% below target                           | ✓ hint      | `DIVERSIFICATION OPPORTUNITY` |
+| Sector neutral               | within 5% of target                             | ℹ️ hint     | `SECTOR FIT`                  |
+| Limited capital              | `cash_pct < 10%`                                | ⚠️ warning  | `LIMITED CAPITAL`             |
+| Tight capital                | `cash_pct 10–25%`                               | ℹ️ hint     | `TIGHT CAPITAL`               |
+| Capital available            | `cash_pct > 25%`                                | ✓ hint      | `CAPITAL AVAILABLE`           |
+| Unlimited capital            | `cash_available == inf`                         | ✓ hint      | `UNLIMITED CAPITAL`           |
 
 ### CLI output format
 
@@ -499,12 +504,12 @@ Every pipeline stage is timed with `time.monotonic()`. The `scan_summary` event 
 ```json
 {
   "step_latencies_ms": {
-    "fetch_ms":     423.0,
-    "prefilter_ms":   1.2,
-    "signal_ms":      0.8,
-    "news_ms":      1250.0,
+    "fetch_ms": 423.0,
+    "prefilter_ms": 1.2,
+    "signal_ms": 0.8,
+    "news_ms": 1250.0,
     "llm_total_ms": 3521.0,
-    "total_ms":     5196.0
+    "total_ms": 5196.0
   }
 }
 ```
@@ -535,17 +540,23 @@ Run once and print results. Useful for testing outside market hours.
 # Explicit watchlist
 python -m src.agents.opportunity.workflow --tickers AAPL MSFT NVDA GOOGL META --once
 
-# Dynamic universe — top 50 S&P 500 constituents
+# Dynamic universe — top 50 S&P 500 constituents (US, default)
 python -m src.agents.opportunity.workflow --top-n 50 --once
 
-# Indian market (NIFTY 50), top 30 stocks
-python -m src.agents.opportunity.workflow --top-n 30 --market IN --once
+# Indian large cap — NIFTY 50
+python -m src.agents.opportunity.workflow --top-n 50 --market IN --once
+
+# Indian mid cap — NIFTY MIDCAP 100
+python -m src.agents.opportunity.workflow --top-n 100 --market IN_MID --once
+
+# Indian small cap — NIFTY SMALLCAP 100
+python -m src.agents.opportunity.workflow --top-n 100 --market IN_SMALL --once
 
 # Override LLM model (provider auto-inferred)
-python -m src.agents.opportunity.workflow --tickers AAPL MSFT NVDA --model gpt-4o --once
+python -m src.agents.opportunity.workflow --top-n 100 --market IN_MID --model gpt-4o --once
 ```
 
-Either `--tickers` or `--top-n` is required.
+Either `--tickers` or `--top-n` is required. `--market` defaults to `US`.
 
 ---
 
@@ -554,14 +565,20 @@ Either `--tickers` or `--top-n` is required.
 Runs automatically while the market is open. Scans every 15 minutes by default.
 
 ```bash
-# US market, explicit watchlist, default interval
+# US market, explicit watchlist, default interval (15 min)
 python -m src.agents.opportunity.workflow --tickers AAPL MSFT NVDA GOOGL META AMZN TSLA
 
-# Dynamic universe, every 5 minutes
+# US dynamic universe, every 5 minutes
 python -m src.agents.opportunity.workflow --top-n 100 --interval 5
 
-# Indian market, every 10 minutes
+# Indian large cap (NIFTY 50), every 10 minutes
 python -m src.agents.opportunity.workflow --top-n 50 --market IN --interval 10
+
+# Indian mid cap (NIFTY MIDCAP 100), every 15 minutes
+python -m src.agents.opportunity.workflow --top-n 100 --market IN_MID --interval 15
+
+# Indian small cap (NIFTY SMALLCAP 100), every 15 minutes
+python -m src.agents.opportunity.workflow --top-n 100 --market IN_SMALL --interval 15
 ```
 
 The process exits automatically when the market closes. Cooldown state persists across cycles.
@@ -596,8 +613,10 @@ for opp in opportunities:
 ```python
 from src.agents.opportunity.markets.market_strategy import get_liquid_universe
 
-us_tickers = get_liquid_universe(n=100, market="US")   # top 100 S&P 500
-in_tickers = get_liquid_universe(n=50,  market="IN")   # top 50 NIFTY 50
+us_tickers  = get_liquid_universe(n=100, market="US")       # top 100 S&P 500
+in_tickers  = get_liquid_universe(n=50,  market="IN")       # NIFTY 50
+mid_tickers = get_liquid_universe(n=100, market="IN_MID")   # NIFTY MIDCAP 100
+sml_tickers = get_liquid_universe(n=100, market="IN_SMALL") # NIFTY SMALLCAP 100
 ```
 
 #### Continuous batch loop
@@ -624,15 +643,15 @@ if is_market_open("US"):
 
 ### Environment Variables
 
-| Variable                  | Required    | Description                                                                            |
-| ------------------------- | ----------- | -------------------------------------------------------------------------------------- |
-| `ALPHA_SCANNER_LLM_MODEL` | Recommended | Model for this agent. Provider auto-inferred. Overrides `PORTFOLIO_LLM_MODEL`.         |
-| `PORTFOLIO_LLM_MODEL`     | Optional    | Fallback model when `ALPHA_SCANNER_LLM_MODEL` is not set.                              |
-| `PORTFOLIO_LLM_PROVIDER`  | Optional    | Fallback provider (`ollama` \| `openai` \| `google`). Default: `ollama`.               |
-| `TRACELOOP_API_KEY`       | Optional    | Enables Traceloop telemetry. Scan runs without it.                                     |
-| `OLLAMA_API_KEY`          | Conditional | Required when using the Ollama provider.                                               |
-| `OPENAI_API_KEY`          | Conditional | Required when using the OpenAI provider.                                               |
-| `GOOGLE_API_KEY`          | Conditional | Required when using the Google provider.                                               |
+| Variable                  | Required    | Description                                                                    |
+| ------------------------- | ----------- | ------------------------------------------------------------------------------ |
+| `ALPHA_SCANNER_LLM_MODEL` | Recommended | Model for this agent. Provider auto-inferred. Overrides `PORTFOLIO_LLM_MODEL`. |
+| `PORTFOLIO_LLM_MODEL`     | Optional    | Fallback model when `ALPHA_SCANNER_LLM_MODEL` is not set.                      |
+| `PORTFOLIO_LLM_PROVIDER`  | Optional    | Fallback provider (`ollama` \| `openai` \| `google`). Default: `ollama`.       |
+| `TRACELOOP_API_KEY`       | Optional    | Enables Traceloop telemetry. Scan runs without it.                             |
+| `OLLAMA_API_KEY`          | Conditional | Required when using the Ollama provider.                                       |
+| `OPENAI_API_KEY`          | Conditional | Required when using the OpenAI provider.                                       |
+| `GOOGLE_API_KEY`          | Conditional | Required when using the Google provider.                                       |
 
 **Model resolution order:**
 
@@ -646,13 +665,26 @@ PORTFOLIO_LLM_PROVIDER  +  provider default model
 
 ---
 
+### Supported Markets
+
+| Code       | Index              | Exchange | Universe size | Hours (local)           |
+| ---------- | ------------------ | -------- | ------------- | ----------------------- |
+| `US`       | S&P 500            | NYSE     | up to 500     | Mon–Fri 09:30–16:00 ET  |
+| `IN`       | NIFTY 50           | NSE      | 50            | Mon–Fri 09:15–15:30 IST |
+| `IN_MID`   | NIFTY MIDCAP 100   | NSE      | 100           | Mon–Fri 09:15–15:30 IST |
+| `IN_SMALL` | NIFTY SMALLCAP 100 | NSE      | 100           | Mon–Fri 09:15–15:30 IST |
+
+All three Indian codes share the same NSE trading-hours check (`_NSEMarketStrategy` base). To add a new index, subclass `_NSEMarketStrategy` and add one entry to `_REGISTRY` in `markets/market_strategy.py`.
+
+---
+
 ### Supported LLM Providers
 
-| Provider key | Models                                                                          |
-| ------------ | ------------------------------------------------------------------------------- |
-| `ollama`     | `gpt-oss:120b`, `llama3`, `llama3:70b`, `mistral`, `mixtral`, `gemma2`, `phi3`  |
+| Provider key | Models                                                                         |
+| ------------ | ------------------------------------------------------------------------------ |
+| `ollama`     | `gpt-oss:120b`, `llama3`, `llama3:70b`, `mistral`, `mixtral`, `gemma2`, `phi3` |
 | `openai`     | `gpt-4o`, `gpt-4o-mini`, `gpt-4-turbo`, `gpt-4`, `gpt-3.5-turbo`               |
-| `google`     | `gemini-1.5-pro`, `gemini-1.5-flash`, `gemini-pro`, `gemini-2.0-flash`          |
+| `google`     | `gemini-1.5-pro`, `gemini-1.5-flash`, `gemini-pro`, `gemini-2.0-flash`         |
 
 Custom or fine-tuned models are accepted — an unknown name emits a warning but does not abort. Set `PORTFOLIO_LLM_PROVIDER` explicitly for custom models.
 
@@ -662,54 +694,54 @@ Custom or fine-tuned models are accepted — an unknown name emits a warning but
 
 **`nodes/alpha_scanner_agent.py`**
 
-| Constant               | Default     | Description                                                                 |
-| ---------------------- | ----------- | --------------------------------------------------------------------------- |
-| `_COOLDOWN_MINUTES`    | `30`        | Cooldown window length (unit determined by `_COOLDOWN_UNIT`)                |
-| `_COOLDOWN_UNIT`       | `"minutes"` | Cooldown unit: `"minutes"` \| `"hours"` \| `"days"`                         |
-| `_CANDIDATE_MIN_SCORE` | `1`         | Minimum signal score required to advance to news + LLM decision             |
-| `_MAX_SECTOR_EXPOSURE` | `60.0`      | Sector allocation % above which `SECTOR CAP EXCEEDED` warning is emitted    |
-| `_MAX_POSITION_WEIGHT` | `10.0`      | Position weight % above which `POSITION CAP EXCEEDED` warning is emitted    |
-| `_MAX_FETCH_WORKERS`   | `10`        | Maximum parallel yfinance fetch threads                                     |
+| Constant               | Default     | Description                                                              |
+| ---------------------- | ----------- | ------------------------------------------------------------------------ |
+| `_COOLDOWN_MINUTES`    | `30`        | Cooldown window length (unit determined by `_COOLDOWN_UNIT`)             |
+| `_COOLDOWN_UNIT`       | `"minutes"` | Cooldown unit: `"minutes"` \| `"hours"` \| `"days"`                      |
+| `_CANDIDATE_MIN_SCORE` | `1`         | Minimum signal score required to advance to news + LLM decision          |
+| `_MAX_SECTOR_EXPOSURE` | `60.0`      | Sector allocation % above which `SECTOR CAP EXCEEDED` warning is emitted |
+| `_MAX_POSITION_WEIGHT` | `10.0`      | Position weight % above which `POSITION CAP EXCEEDED` warning is emitted |
+| `_MAX_FETCH_WORKERS`   | `10`        | Maximum parallel yfinance fetch threads                                  |
 
 **`nodes/decision_node.py`**
 
-| Constant                      | Default | Description                                                                  |
-| ----------------------------- | ------- | ---------------------------------------------------------------------------- |
-| `_MAX_LLM_WORKERS`            | `5`     | Maximum concurrent LLM decision threads per scan cycle                       |
-| `_DECISION_CACHE_TTL_MINUTES` | `15`    | LLM response cache lifetime (key: `ticker:score:type`)                       |
-| `_SECTOR_UNDERWEIGHT_BOOST`   | `0.5`   | Ranking score bonus per % a sector is below `_SECTOR_TARGET_WEIGHT`          |
-| `_SECTOR_TARGET_WEIGHT`       | `20.0`  | Target sector allocation % used for diversification hints and rank boosts    |
+| Constant                      | Default | Description                                                               |
+| ----------------------------- | ------- | ------------------------------------------------------------------------- |
+| `_MAX_LLM_WORKERS`            | `5`     | Maximum concurrent LLM decision threads per scan cycle                    |
+| `_DECISION_CACHE_TTL_MINUTES` | `15`    | LLM response cache lifetime (key: `ticker:score:type`)                    |
+| `_SECTOR_UNDERWEIGHT_BOOST`   | `0.5`   | Ranking score bonus per % a sector is below `_SECTOR_TARGET_WEIGHT`       |
+| `_SECTOR_TARGET_WEIGHT`       | `20.0`  | Target sector allocation % used for diversification hints and rank boosts |
 
 **`nodes/news_node.py`**
 
-| Constant           | Default | Description                                    |
-| ------------------ | ------- | ---------------------------------------------- |
-| `_MAX_HEADLINES`   | `5`     | Max headlines per ticker sent to the LLM       |
-| `_MAX_NEWS_WORKERS`| `3`     | Max parallel news LLM threads                  |
+| Constant            | Default | Description                              |
+| ------------------- | ------- | ---------------------------------------- |
+| `_MAX_HEADLINES`    | `5`     | Max headlines per ticker sent to the LLM |
+| `_MAX_NEWS_WORKERS` | `3`     | Max parallel news LLM threads            |
 
 **`engines/signal_engine.py` → `_WEIGHTS`**
 
-| Key                | Default | Description                                           |
-| ------------------ | ------- | ----------------------------------------------------- |
-| `pe_improvement`   | `+1`    | Forward PE improving relative to trailing             |
-| `52w_lower_band`   | `+1`    | Price in lower 30% of 52-week range                   |
-| `analyst_bullish`  | `+1`    | Buy/strong_buy consensus (≥ 3 analysts, > 5% upside)  |
-| `buying_pressure`  | `+1`    | Price up on volume spike (≥ 1.5× avg)                 |
-| `near_52w_high`    | `−1`    | Near 52-week high — unfavourable entry                |
-| `analyst_bearish`  | `−1`    | Underperform/sell consensus (≥ 3 analysts)            |
-| `selling_pressure` | `−1`    | Price down on volume spike (≥ 1.5× avg)               |
-| `volatility`       | `−2`    | Volatility penalty (cancels two bullish signals)      |
+| Key                | Default | Description                                          |
+| ------------------ | ------- | ---------------------------------------------------- |
+| `pe_improvement`   | `+1`    | Forward PE improving relative to trailing            |
+| `52w_lower_band`   | `+1`    | Price in lower 30% of 52-week range                  |
+| `analyst_bullish`  | `+1`    | Buy/strong_buy consensus (≥ 3 analysts, > 5% upside) |
+| `buying_pressure`  | `+1`    | Price up on volume spike (≥ 1.5× avg)                |
+| `near_52w_high`    | `−1`    | Near 52-week high — unfavourable entry               |
+| `analyst_bearish`  | `−1`    | Underperform/sell consensus (≥ 3 analysts)           |
+| `selling_pressure` | `−1`    | Price down on volume spike (≥ 1.5× avg)              |
+| `volatility`       | `−2`    | Volatility penalty (cancels two bullish signals)     |
 
 **`engines/signal_engine.py` → `_THRESHOLDS`**
 
-| Key                    | Default | Description                                       |
-| ---------------------- | ------- | ------------------------------------------------- |
-| `volatility_penalty`   | `0.35`  | Annualised volatility above this → weight applied |
-| `near_52w_high_pct`    | `0.05`  | Within this fraction of 52w high → −1 point       |
-| `lower_30_band_pct`    | `0.30`  | Price in lower 30% of range → +1 point            |
-| `min_analyst_count`    | `3`     | Minimum analysts required for consensus signals   |
-| `analyst_target_upside`| `0.05`  | Min target upside (> 5%) for bullish signal       |
-| `vol_spike_ratio`      | `1.5`   | Volume ratio threshold for pressure signals       |
+| Key                     | Default | Description                                       |
+| ----------------------- | ------- | ------------------------------------------------- |
+| `volatility_penalty`    | `0.35`  | Annualised volatility above this → weight applied |
+| `near_52w_high_pct`     | `0.05`  | Within this fraction of 52w high → −1 point       |
+| `lower_30_band_pct`     | `0.30`  | Price in lower 30% of range → +1 point            |
+| `min_analyst_count`     | `3`     | Minimum analysts required for consensus signals   |
+| `analyst_target_upside` | `0.05`  | Min target upside (> 5%) for bullish signal       |
+| `vol_spike_ratio`       | `1.5`   | Volume ratio threshold for pressure signals       |
 
 **`engines/prefilter_engine.py` → `_PREFILTER_THRESHOLDS`**
 
@@ -756,22 +788,22 @@ Other trigger patterns: volatility alerts, earnings calendar, index rebalance ev
 
 ## Design Decisions
 
-| Decision                                                  | Rationale                                                                                                                                                                                                       |
-| --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **3-node LangGraph graph (scanner → news → decision)**    | Each node has one responsibility. NewsNode can be disabled or swapped independently. DecisionNode isolation makes it easy to replace the LLM without touching fetch or signal logic.                            |
-| **NewsNode only for candidates**                          | Fetching headlines + running LLM for every ticker in a 200-stock universe adds ~200 LLM calls per scan. Running news only on candidates (score ≥ 1) keeps cost proportional to signal quality.                 |
-| **Analyst signals in SignalEngine, not LLM prompt only**  | Analyst consensus is a quantitative fact (rating + count + target). Encoding it as a scored signal (+1/−1) means it affects the tier and candidate filter deterministically, not just LLM verdict probability.  |
-| **Vol pressure proxy from free data**                     | Level-2 order flow requires a paid data feed. Price direction × volume spike is a free, reproducible proxy for institutional buy/sell pressure available in every yfinance info call.                           |
-| **`engines/`, `nodes/`, `markets/` subfolders**           | Groups files by responsibility: engines are pure computation (no I/O, no graph nodes); nodes are LangGraph-runnable pipeline stages; markets isolate exchange-specific schedules and universes.                  |
-| **PreFilterEngine before SignalEngine**                   | At 500+ tickers, running 8 signals and LLM on every ticker is expensive. The prefilter drops uninteresting tickers with zero scoring cost.                                                                      |
-| **Volatility weight = −2**                                | A weight of −1 let `pe_improvement (+1) + 52w_lower_band (+1) + volatility (−1) = +1` pass. At −2 the net is 0 (neutral) and the ticker does not advance.                                                     |
-| **Type from SignalEngine, not LLM**                       | `dip_buy / value / momentum` is inferred from which fundamental signals fired. Deterministic inference is reproducible across providers and immune to prompt drift.                                              |
-| **Warnings, not filters for cap breaches**                | Silently removing a ticker creates invisible blind spots. A `⚠️ POSITION CAP EXCEEDED` warning in the output is more actionable than hiding the recommendation entirely.                                        |
-| **Auto-fetch via PortfolioAgent pipeline**                | Running `PortfolioAgent → MarketAgent → RiskAgent` ensures allocation % use current market prices. Without `MarketAgent`, a 15-share MSFT position at avg_cost $403 appears ~40% of a $15k portfolio.         |
-| **LLM parallelisation + short-TTL cache**                 | 5 concurrent decision threads reduce wall-clock time from N×3.5s to ~3.5s. The 15-min cache prevents redundant API calls for the same ticker in the same signal state across repeated intraday scans.          |
-| **Portfolio-fit boost on rank, not raw score**            | Underweight sectors surface higher in the sorted list without corrupting the raw signal score. The `score` field in output always reflects quantitative signals only.                                            |
-| **`zoneinfo` over `pytz`**                                | `zoneinfo` is Python 3.9+ stdlib — zero extra dependency, identical capability for NYSE/NSE hours checking.                                                                                                     |
-| **`OllamaProvider.max_concurrency = 1`**                  | Ollama returns HTTP 429 when multiple requests arrive simultaneously. Capping workers to 1 (`min(candidates, max_concurrency)`) eliminates 429 errors without retrying.                                          |
+| Decision                                                 | Rationale                                                                                                                                                                                                                                                                                                                                                                                                       |
+| -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **3-node LangGraph graph (scanner → news → decision)**   | Each node has one responsibility. NewsNode can be disabled or swapped independently. DecisionNode isolation makes it easy to replace the LLM without touching fetch or signal logic.                                                                                                                                                                                                                            |
+| **NewsNode only for candidates**                         | Fetching headlines + running LLM for every ticker in a 200-stock universe adds ~200 LLM calls per scan. Running news only on candidates (score ≥ 1) keeps cost proportional to signal quality.                                                                                                                                                                                                                  |
+| **Analyst signals in SignalEngine, not LLM prompt only** | Analyst consensus is a quantitative fact (rating + count + target). Encoding it as a scored signal (+1/−1) means it affects the tier and candidate filter deterministically, not just LLM verdict probability.                                                                                                                                                                                                  |
+| **Vol pressure proxy from free data**                    | Level-2 order flow requires a paid data feed. Price direction × volume spike is a free, reproducible proxy for institutional buy/sell pressure available in every yfinance info call.                                                                                                                                                                                                                           |
+| **`engines/`, `nodes/`, `markets/` subfolders**          | Groups files by responsibility: engines are pure computation (no I/O, no graph nodes); nodes are LangGraph-runnable pipeline stages; markets isolate exchange-specific schedules and universes.                                                                                                                                                                                                                 |
+| **PreFilterEngine before SignalEngine**                  | At 500+ tickers, running 8 signals and LLM on every ticker is expensive. The prefilter drops uninteresting tickers with zero scoring cost.                                                                                                                                                                                                                                                                      |
+| **Volatility weight = −2**                               | A weight of −1 let `pe_improvement (+1) + 52w_lower_band (+1) + volatility (−1) = +1` pass. At −2 the net is 0 (neutral) and the ticker does not advance.                                                                                                                                                                                                                                                       |
+| **Type from SignalEngine, not LLM**                      | `dip_buy / value / momentum` is inferred from which fundamental signals fired. Deterministic inference is reproducible across providers and immune to prompt drift.                                                                                                                                                                                                                                             |
+| **Warnings, not filters for cap breaches**               | Silently removing a ticker creates invisible blind spots. A `⚠️ POSITION CAP EXCEEDED` warning in the output is more actionable than hiding the recommendation entirely.                                                                                                                                                                                                                                        |
+| **Auto-fetch via PortfolioAgent pipeline**               | Running `PortfolioAgent → MarketAgent → RiskAgent` ensures allocation % use current market prices. Without `MarketAgent`, a 15-share MSFT position at avg_cost $403 appears ~40% of a $15k portfolio.                                                                                                                                                                                                           |
+| **LLM parallelisation + short-TTL cache**                | 5 concurrent decision threads reduce wall-clock time from N×3.5s to ~3.5s. The 15-min cache prevents redundant API calls for the same ticker in the same signal state across repeated intraday scans.                                                                                                                                                                                                           |
+| **Portfolio-fit boost on rank, not raw score**           | Underweight sectors surface higher in the sorted list without corrupting the raw signal score. The `score` field in output always reflects quantitative signals only.                                                                                                                                                                                                                                           |
+| **`zoneinfo` over `pytz`**                               | `zoneinfo` is Python 3.9+ stdlib — zero extra dependency, identical capability for NYSE/NSE hours checking.                                                                                                                                                                                                                                                                                                     |
+| **`OllamaProvider.max_concurrency = 1`**                 | Ollama returns HTTP 429 when multiple requests arrive simultaneously. All three LLM call sites — `DecisionNode`, `NewsNode`, `OpportunityDecisionAgent` — cap workers via `min(candidates, provider.max_concurrency, _MAX_LLM_WORKERS)`. A secondary 3-attempt exponential-backoff retry (2 s → 4 s) in `OpportunityDecisionAgent` and `_summarise_news` handles any 429 that slips through on cloud providers. |
 
 ---
 
