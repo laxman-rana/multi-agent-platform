@@ -27,6 +27,7 @@ PORTFOLIO: Dict[str, Any] = {
         {"ticker": "NVDA",  "shares": 30, "avg_cost":  173.0, "sector": "Technology"},
         {"ticker": "HOOD", "shares": 10, "avg_cost": 75.0, "sector": "Financials"},
         {"ticker": "SOFI",  "shares": 25, "avg_cost": 18.0, "sector": "Financials"},
-        {"ticker": "AMZN", "shares":  8, "avg_cost": 209.0, "sector": "Technology"},
+        {"ticker": "AMZN", "shares":  8, "avg_cost": 209.0, "sector": "Consumer Discretionary"},
+        
     ],
 }

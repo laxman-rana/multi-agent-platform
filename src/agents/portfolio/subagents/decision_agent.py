@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,7 +16,7 @@ from src.agents.portfolio.tools.scoring import score_stock
 from src.agents.portfolio.tools.rebalance_tools import compute_portfolio_action
 from src.agents.portfolio.tools.news_tools import compute_news_score
 from src.observability import get_telemetry_logger
-from src.llm import get_llm
+from src.llm import get_llm, get_provider
 
 logger = logging.getLogger(__name__)
 
@@ -601,7 +602,13 @@ class DecisionAgent:
             tkr, ins, nws, gpct, alloc, issues, pctx, qscore, hyrs = args
             return tkr, self._decide(tkr, ins, nws, gpct, alloc, issues, pctx, qscore, horizon_years=hyrs)
 
-        with ThreadPoolExecutor(max_workers=len(ticker_args) or 1) as pool:
+        # Cap concurrency to the provider's declared limit.
+        # OllamaProvider.max_concurrency == 1 → sequential calls, preventing 429s.
+        # Cloud providers default to 10, preserving full parallelism.
+        _provider_name = os.getenv("PORTFOLIO_LLM_PROVIDER", "ollama")
+        _max_workers = min(len(ticker_args), get_provider(_provider_name).max_concurrency) or 1
+
+        with ThreadPoolExecutor(max_workers=_max_workers) as pool:
             futures = {pool.submit(_call, args): args[0] for args in ticker_args}
             for future in as_completed(futures):
                 ticker, decision = future.result()  # propagates exceptions
@@ -682,7 +689,22 @@ class DecisionAgent:
 
         last_error: Exception = RuntimeError("No attempts made")
         for attempt in range(2):
-            response = llm.invoke(messages)
+            # Retry loop for transient Ollama 429s (shouldn't happen with
+            # max_concurrency=1 but guards against external concurrent callers).
+            for _retry in range(3):
+                try:
+                    response = llm.invoke(messages)
+                    break
+                except Exception as exc:
+                    if "429" in str(exc) and _retry < 2:
+                        _wait = 2.0 * (2 ** _retry)
+                        logger.warning(
+                            "[DecisionAgent] %s: Ollama 429 — retry %d/2 in %.0fs",
+                            ticker, _retry + 1, _wait,
+                        )
+                        time.sleep(_wait)
+                    else:
+                        raise
             telemetry.log_llm_interaction(
                 prompt=f"[{ticker}] {human_msg}",
                 response=response.content,

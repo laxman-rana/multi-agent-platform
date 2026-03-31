@@ -63,16 +63,17 @@ python -m src.agents.portfolio.workflow
 # Skip NewsAgent
 python -m src.agents.portfolio.workflow --no-news
 
-# Select LLM provider and model
-python -m src.agents.portfolio.workflow --provider openai --model gpt-4-turbo
-python -m src.agents.portfolio.workflow --provider google --model gemini-pro
-python -m src.agents.portfolio.workflow --provider ollama --model llama3
+# Select model — provider is inferred automatically
+python -m src.agents.portfolio.workflow --model gpt-4-turbo
+python -m src.agents.portfolio.workflow --model gemini-pro
+python -m src.agents.portfolio.workflow --model llama3
 ```
 
-Use `--provider` (choices: `ollama`, `openai`, `google`) and `--model` to select
-the LLM at runtime. Both flags default to the current `PORTFOLIO_LLM_PROVIDER` /
-`PORTFOLIO_LLM_MODEL` env vars, falling back to `ollama` / provider default.
-Unknown providers are rejected at startup with a clear error message.
+Use `--model` to select the LLM at runtime. The provider is **inferred
+automatically** from the model name. Unknown models fail fast at startup with a
+clear error listing all known models across every provider.
+For custom/fine-tuned models, set `PORTFOLIO_LLM_PROVIDER` as an explicit
+override (env var only — no CLI flag).
 
 See [src/agents/portfolio/README.md](src/agents/portfolio/README.md) for the full portfolio documentation.
 

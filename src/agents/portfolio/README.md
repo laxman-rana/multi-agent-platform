@@ -51,13 +51,13 @@ renders the final human-readable report.
 
 **Key design goals:**
 
-| Goal                | Implementation                                                                              |
-| ------------------- | ------------------------------------------------------------------------------------------- |
-| Single shared state | `PortfolioState` dataclass passed through every LangGraph node                              |
-| Decoupled agents    | Each agent only reads/writes specific state fields                                          |
-| Conditional logic   | Volatility-driven routing — skip or include `NewsAgent`                                     |
-| Real LLM decisions  | `DecisionAgent` calls `get_llm()` via `--provider` flag or `PORTFOLIO_LLM_PROVIDER` env var |
-| Live market data    | `market_tools` and `news_tools` fetch live data via `yfinance` + VADER + RSS fallback       |
+| Goal                | Implementation                                                                        |
+| ------------------- | ------------------------------------------------------------------------------------- |
+| Single shared state | `PortfolioState` dataclass passed through every LangGraph node                        |
+| Decoupled agents    | Each agent only reads/writes specific state fields                                    |
+| Conditional logic   | Volatility-driven routing — skip or include `NewsAgent`                               |
+| Real LLM decisions  | `DecisionAgent` calls `get_llm()` — provider is auto-inferred from the model name     |
+| Live market data    | `market_tools` and `news_tools` fetch live data via `yfinance` + VADER + RSS fallback |
 
 ---
 
@@ -92,12 +92,12 @@ post-processed by the deterministic layer** before being used.
 
 **Provider / model selection:**
 
-| Env var                         | CLI flag     | Purpose                                                   |
-| ------------------------------- | ------------ | --------------------------------------------------------- |
-| `PORTFOLIO_LLM_PROVIDER`        | `--provider` | Decision agent provider (`ollama` / `openai` / `google`)  |
-| `PORTFOLIO_LLM_MODEL`           | `--model`    | Decision agent model name                                 |
-| `PORTFOLIO_CRITIC_LLM_PROVIDER` | —            | Critic provider (defaults to decision provider)           |
-| `PORTFOLIO_CRITIC_LLM_MODEL`    | —            | Critic model (recommended: different from decision model) |
+| Env var / CLI                | Purpose                                                                                           |
+| ---------------------------- | ------------------------------------------------------------------------------------------------- |
+| `--model MODEL_NAME`         | Decision agent model. Provider is **inferred automatically** from the model name.                 |
+| `PORTFOLIO_LLM_MODEL`        | Same as `--model`, env-var form.                                                                  |
+| `PORTFOLIO_LLM_PROVIDER`     | Override provider for **custom/unknown models only** (emits a warning when used).                 |
+| `PORTFOLIO_CRITIC_LLM_MODEL` | Critic model. Provider is inferred. Recommended: use a different model to avoid self-review bias. |
 
 **Execution:** all per-ticker LLM calls run concurrently via `ThreadPoolExecutor`
 (`max_workers = n_tickers`), reducing wall time from `n × ~5s` to `~5–8s`.
@@ -566,25 +566,23 @@ and the tier label are injected into the prompt as the primary decision anchor:
 
 #### LLM provider and model selection
 
-The provider and model can be set three ways (highest to lowest priority):
+Specify only `--model`. The provider is **inferred automatically** from the model name.
+No `--provider` flag is needed or accepted.
 
-| Method                       | Example                                                                           |
-| ---------------------------- | --------------------------------------------------------------------------------- |
-| CLI `--provider` / `--model` | `--provider openai --model gpt-4-turbo`                                           |
-| Environment variables        | `$env:PORTFOLIO_LLM_PROVIDER="openai"` / `$env:PORTFOLIO_LLM_MODEL="gpt-4-turbo"` |
-| Built-in defaults            | `ollama` / `gpt-oss:120b`                                                         |
+| Method            | Example                                         |
+| ----------------- | ----------------------------------------------- |
+| CLI `--model`     | `--model gpt-4o`                                |
+| Environment var   | `$env:PORTFOLIO_LLM_MODEL="gpt-4o"`             |
+| Built-in defaults | `ollama` / `gpt-oss:120b` (when nothing is set) |
 
 ```powershell
 # Use defaults (ollama / gpt-oss:120b)
 python -m src.agents.portfolio.workflow
 
-# Switch provider only
-python -m src.agents.portfolio.workflow --provider openai
-
-# Switch provider and model
-python -m src.agents.portfolio.workflow --provider openai --model gpt-4-turbo
-python -m src.agents.portfolio.workflow --provider google --model gemini-pro
-python -m src.agents.portfolio.workflow --provider ollama --model llama3
+# Switch model — provider is inferred
+python -m src.agents.portfolio.workflow --model gpt-4o
+python -m src.agents.portfolio.workflow --model gemini-1.5-pro
+python -m src.agents.portfolio.workflow --model llama3
 ```
 
 Default models per provider:
@@ -595,9 +593,10 @@ Default models per provider:
 | `openai` | `gpt-4o`         |
 | `google` | `gemini-1.5-pro` |
 
-Unknown provider names are rejected at startup with a clear error message before
-any LLM call is made. Unknown model names (for custom/fine-tuned models not in
-the known list) emit a warning but still proceed.
+Unknown model names fail fast at startup with a clear error listing all known
+models across every provider. For custom/fine-tuned models not in the known list,
+set `PORTFOLIO_LLM_PROVIDER` explicitly — that env var is only consulted as a
+last resort and emits a warning.
 
 ---
 
@@ -630,14 +629,13 @@ A single portfolio-level LLM call — **one call for all tickers** — that chec
 4. **Internal inconsistency** — conflicting decisions on correlated tickers without explanation.
 
 The LLM for the critic can be a **different model** from the decision agent to
-avoid self-review bias:
+avoid self-review bias. Only the model name is needed — provider is inferred:
 
 ```powershell
-$env:PORTFOLIO_CRITIC_LLM_PROVIDER = "openai"
-$env:PORTFOLIO_CRITIC_LLM_MODEL    = "gpt-4o"
+$env:PORTFOLIO_CRITIC_LLM_MODEL = "gpt-4o"   # openai inferred automatically
 ```
 
-When unset, falls back to `PORTFOLIO_LLM_PROVIDER` / `PORTFOLIO_LLM_MODEL`.
+When unset, falls back to `PORTFOLIO_LLM_MODEL` / `PORTFOLIO_LLM_PROVIDER`.
 LLM failures silently fall back to `approved = True` — hardcoded rules still
 apply regardless.
 
@@ -953,24 +951,24 @@ news data is not required.
 
 ### Switch the LLM provider or model
 
-Use the `--provider` and `--model` CLI flags — no code or env var changes needed:
+Use the `--model` CLI flag — provider is inferred, no code changes needed:
 
 ```powershell
-python -m src.agents.portfolio.workflow --provider openai --model gpt-4-turbo
-python -m src.agents.portfolio.workflow --provider google --model gemini-pro
-python -m src.agents.portfolio.workflow --provider ollama --model llama3
+python -m src.agents.portfolio.workflow --model gpt-4-turbo
+python -m src.agents.portfolio.workflow --model gemini-pro
+python -m src.agents.portfolio.workflow --model llama3
 ```
 
-Or set environment variables to make the selection persist across runs:
+Or set the environment variable to make the selection persist across runs:
 
 ```powershell
-$env:PORTFOLIO_LLM_PROVIDER = "openai"
-$env:PORTFOLIO_LLM_MODEL    = "gpt-4-turbo"
+$env:PORTFOLIO_LLM_MODEL = "gpt-4-turbo"
 python -m src.agents.portfolio.workflow
 ```
 
-Running `python -m src.agents.portfolio.workflow --help` shows the current active
-provider and model in the flag descriptions.
+Provider is inferred automatically from the model name. Running
+`python -m src.agents.portfolio.workflow --help` shows the current active
+model in the flag description.
 
 ### Add a new ticker
 

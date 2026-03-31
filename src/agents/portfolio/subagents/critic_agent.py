@@ -53,17 +53,26 @@ def _run_llm_critique(
 ) -> Dict[str, Any]:
     """Call the LLM critic and return parsed JSON. Falls back to approval on any error.
 
-    Provider and model are read from PORTFOLIO_CRITIC_LLM_PROVIDER /
-    PORTFOLIO_CRITIC_LLM_MODEL env vars, falling back to the decision-agent
-    values when not set. Configure both to a different model than the decision
-    agent to avoid self-review bias.
+    Model is read from PORTFOLIO_CRITIC_LLM_MODEL env var (falls back to the
+    decision-agent model when not set). Provider is inferred automatically from
+    the model name — no need to set PORTFOLIO_CRITIC_LLM_PROVIDER separately.
+    Set PORTFOLIO_CRITIC_LLM_MODEL to a different model than the decision agent
+    to avoid self-review bias.
     """
     import os
-    critic_provider = os.getenv(
-        "PORTFOLIO_CRITIC_LLM_PROVIDER",
-        os.getenv("PORTFOLIO_LLM_PROVIDER", "ollama"),
-    )
+    from src.llm import infer_provider
+
     critic_model = os.getenv("PORTFOLIO_CRITIC_LLM_MODEL") or None
+    if critic_model:
+        try:
+            critic_provider = infer_provider(critic_model)
+        except ValueError as exc:
+            logger.warning("[CriticAgent] Unknown critic model, skipping LLM critique: %s", exc)
+            return {"approved": True, "feedback": ""}
+    else:
+        # Fall back to the same model/provider as the decision agent.
+        critic_model = os.getenv("PORTFOLIO_LLM_MODEL") or None
+        critic_provider = os.getenv("PORTFOLIO_LLM_PROVIDER", "ollama")
 
     risk_level = user_profile.get("risk_level", "moderate")
     horizon = user_profile.get("investment_horizon", "unknown")

@@ -6,9 +6,11 @@ Entry point for the portfolio multi-agent analysis workflow.
 Run from the repository root:
     python -m src.agents.portfolio.workflow
     python -m src.agents.portfolio.workflow --no-news
-    python -m src.agents.portfolio.workflow --provider openai
-    python -m src.agents.portfolio.workflow --provider openai --model gpt-4-turbo
-    python -m src.agents.portfolio.workflow --provider ollama --model llama3
+    python -m src.agents.portfolio.workflow --model gpt-4o
+    python -m src.agents.portfolio.workflow --model gemini-1.5-pro
+    python -m src.agents.portfolio.workflow --model llama3
+
+Provider is inferred automatically from the model name.
 """
 
 import argparse
@@ -197,29 +199,30 @@ def build_graph(skip_news: bool = False):
     return graph.compile()
 
 
-def main(skip_news: bool = False, provider: str | None = None, model: str | None = None) -> None:
-    # Write resolved values back to env so the lru_cache in _get_decision_llm()
-    # picks them up on first call.  provider always has a value (CLI arg default
-    # is the current env var or "ollama"); model may be None meaning "use the
-    # provider's built-in default".
-    if provider:
-        os.environ["PORTFOLIO_LLM_PROVIDER"] = provider
-    if model:
-        os.environ["PORTFOLIO_LLM_MODEL"] = model
-    elif "PORTFOLIO_LLM_MODEL" in os.environ and not model:
-        # If user didn't pass --model, preserve whatever env var was already set.
-        pass
+def main(skip_news: bool = False, model: str | None = None) -> None:
+    # Resolve model → infer provider automatically.
+    # If --model is not given, fall back to PORTFOLIO_LLM_MODEL env var, then
+    # default to the ollama built-in default.
+    from src.llm.providers import _DEFAULT_MODELS, infer_provider
 
-    _provider = os.getenv("PORTFOLIO_LLM_PROVIDER", "ollama")
-    from src.llm.providers import _DEFAULT_MODELS, validate_provider_model
-    _model = os.getenv("PORTFOLIO_LLM_MODEL", _DEFAULT_MODELS.get(_provider, "(default)"))
+    _env_model = os.getenv("PORTFOLIO_LLM_MODEL")
+    resolved_model = model or _env_model
 
-    # Validate provider and model before touching the graph or LLM.
-    try:
-        validate_provider_model(_provider, os.getenv("PORTFOLIO_LLM_MODEL"))
-    except ValueError as exc:
-        print(f"\n[Configuration error] {exc}")
-        raise SystemExit(1) from None
+    if resolved_model:
+        try:
+            resolved_provider = infer_provider(resolved_model)
+        except ValueError as exc:
+            print(f"\n[Configuration error] {exc}")
+            raise SystemExit(1) from None
+        os.environ["PORTFOLIO_LLM_PROVIDER"] = resolved_provider
+        os.environ["PORTFOLIO_LLM_MODEL"] = resolved_model
+    else:
+        # No model specified — use defaults
+        resolved_provider = os.getenv("PORTFOLIO_LLM_PROVIDER", "ollama")
+        resolved_model = _DEFAULT_MODELS.get(resolved_provider, "(default)")
+
+    _provider = resolved_provider
+    _model = resolved_model
 
     logging.basicConfig(
         level=logging.INFO,
@@ -278,8 +281,7 @@ def main(skip_news: bool = False, provider: str | None = None, model: str | None
 
 
 if __name__ == "__main__":
-    _env_provider = os.getenv("PORTFOLIO_LLM_PROVIDER", "ollama")
-    _env_model    = os.getenv("PORTFOLIO_LLM_MODEL")          # None when not set
+    _env_model = os.getenv("PORTFOLIO_LLM_MODEL")
 
     parser = argparse.ArgumentParser(description="Run the portfolio analysis workflow.")
     parser.add_argument(
@@ -288,23 +290,14 @@ if __name__ == "__main__":
         help="Skip the NewsAgent even when high-volatility tickers are detected.",
     )
     parser.add_argument(
-        "--provider",
-        default=_env_provider,
-        choices=["ollama", "openai", "google"],
-        help=(
-            f"LLM provider to use. "
-            f"(current: '{_env_provider}' — set via PORTFOLIO_LLM_PROVIDER or default)"
-        ),
-    )
-    parser.add_argument(
         "--model",
         default=_env_model,
         metavar="MODEL_NAME",
         help=(
-            "Model name for the selected provider "
-            f"(current: '{_env_model or 'provider default'}' — set via PORTFOLIO_LLM_MODEL). "
-            "Examples: llama3, gpt-4-turbo, gemini-pro."
+            "Model to use. Provider is inferred automatically from the model name. "
+            f"(current: '{_env_model or 'default: gpt-oss:120b / ollama'}') "
+            "Examples: gpt-4o, gemini-1.5-pro, llama3, gpt-4-turbo."
         ),
     )
     args = parser.parse_args()
-    main(skip_news=args.no_news, provider=args.provider, model=args.model)
+    main(skip_news=args.no_news, model=args.model)

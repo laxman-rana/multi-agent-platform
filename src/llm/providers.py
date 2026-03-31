@@ -34,18 +34,16 @@ _KNOWN_MODELS: dict[str, list[str]] = {
 
 def validate_provider_model(provider: str, model: str | None = None) -> None:
     """
-    Raise ValueError with a clear message when the provider or model is unknown.
-
-    Provider must be in PROVIDERS.  Model is validated as a known name if
-    provided; unknown models emit a warning (not an error) since providers
-    accept custom / fine-tuned model names that are not in the list.
+    Raise ValueError with a clear message when the provider is unknown.
+    Unknown model names emit a warning (not an error) since providers accept
+    custom / fine-tuned model names not in the known list.
     """
     if provider not in PROVIDERS:
         supported = ", ".join(sorted(PROVIDERS))
         raise ValueError(
             f"Unsupported provider '{provider}'. "
             f"Supported providers: {supported}.\n"
-            f"Set via --provider flag or PORTFOLIO_LLM_PROVIDER env var."
+            f"Set via PORTFOLIO_LLM_PROVIDER env var."
         )
     if model is not None:
         known = _KNOWN_MODELS.get(provider, [])
@@ -59,8 +57,54 @@ def validate_provider_model(provider: str, model: str | None = None) -> None:
             )
 
 
+def infer_provider(model: str) -> str:
+    """Infer the provider from a model name using the known-models registry.
+
+    Raises ValueError immediately if the model is not recognised in any
+    provider's known list and PORTFOLIO_LLM_PROVIDER is not set as a fallback.
+    This gives a clear, actionable error before any LLM call is attempted.
+    """
+    for provider, models in _KNOWN_MODELS.items():
+        if model in models:
+            return provider
+
+    # Unknown model — allow explicit provider override via env var
+    import os
+    explicit = os.getenv("PORTFOLIO_LLM_PROVIDER")
+    if explicit:
+        if explicit not in PROVIDERS:
+            raise ValueError(
+                f"PORTFOLIO_LLM_PROVIDER='{explicit}' is not a supported provider. "
+                f"Supported: {', '.join(sorted(PROVIDERS))}."
+            )
+        import warnings
+        warnings.warn(
+            f"Model '{model}' is not in the known model list. "
+            f"Using provider '{explicit}' from PORTFOLIO_LLM_PROVIDER env var. "
+            "If the model name is wrong the LLM call will fail.",
+            stacklevel=2,
+        )
+        return explicit
+
+    known_lines = "\n".join(
+        f"  {p}: {', '.join(m)}" for p, m in _KNOWN_MODELS.items()
+    )
+    raise ValueError(
+        f"Unknown model '{model}'. Cannot infer provider automatically.\n"
+        f"Known models:\n{known_lines}\n\n"
+        f"To use a custom model, also set:\n"
+        f"  $env:PORTFOLIO_LLM_PROVIDER = \"ollama\"  # or openai / google"
+    )
+
+
 class LLMProvider(ABC):
     """Abstract base class for LLM providers."""
+
+    max_concurrency: int = 10
+    """Maximum number of concurrent LLM calls this provider can handle.
+    Cloud providers (OpenAI, Google) support many parallel requests.
+    Override to a lower value for providers with strict concurrency limits.
+    """
 
     @abstractmethod
     def get_llm(self, tools=None, callbacks=None, model: str | None = None):
@@ -75,6 +119,8 @@ class LLMProvider(ABC):
 
 class OllamaProvider(LLMProvider):
     """Provider for Ollama-hosted models."""
+
+    max_concurrency: int = 1  # local Ollama processes one request at a time
 
     def get_llm(self, tools=None, callbacks=None, model: str | None = None):
         from langchain_ollama import ChatOllama
