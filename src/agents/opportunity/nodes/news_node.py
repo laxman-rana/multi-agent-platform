@@ -26,12 +26,17 @@ import yfinance as yf
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.agents.opportunity.state import OpportunityState
+from src.agents.opportunity.engines.signal_engine import _tier as _score_to_tier
 from src.llm import get_llm, get_provider, infer_provider
 
 logger = logging.getLogger(__name__)
 
 _MAX_HEADLINES  = 5   # headlines per ticker sent to the LLM
 _MAX_NEWS_WORKERS = 3  # max parallel LLM calls (Ollama concurrency caps this further)
+
+# Fundamental risk guardrail: big drop + bad news = falling knife, not a buy.
+_FUNDAMENTAL_RISK_DROP_PCT: float = 10.0  # abs(change_pct) threshold
+_FUNDAMENTAL_RISK_PENALTY:  int   = -2    # score adjustment applied
 
 _NEWS_SYSTEM_PROMPT = """You are a financial news analyst.
 
@@ -136,6 +141,50 @@ def _summarise_news(ticker: str, headlines: List[str]) -> Dict[str, Any]:
         }
 
 
+def _apply_fundamental_risk_penalty(state: "OpportunityState") -> "OpportunityState":
+    """
+    Post-news guardrail: downgrade score by −2 when a large price drop coincides
+    with negative news sentiment.
+
+    Prevents the capitulation signal (+2) from producing a BUY when the drop is
+    caused by fraud, earnings collapse, or structural decline rather than
+    indiscriminate panic.  Rule: if abs(change_pct) ≥ 10% AND sentiment == "negative",
+    the stock is a falling knife — penalise the score so it needs stronger
+    fundamental support to cross the BUY threshold.
+    """
+    for ticker in state.candidates:
+        news = state.news_sentiment.get(ticker)
+        if not news or news.get("sentiment") != "negative":
+            continue
+
+        mdata      = state.market_data.get(ticker, {})
+        change_pct = mdata.get("change_pct", 0.0) or 0.0
+        if change_pct > -_FUNDAMENTAL_RISK_DROP_PCT:
+            continue
+
+        sig = state.signals.get(ticker)
+        if sig is None:
+            continue
+
+        old_score = sig["score"]
+        new_score = old_score + _FUNDAMENTAL_RISK_PENALTY
+        sig["score"] = new_score
+        sig["tier"]  = _score_to_tier(new_score)
+        catalyst_snippet = (news.get("catalyst") or "")[:70]
+        sig["signals"] = sig.get("signals", []) + [
+            f"\u26a0 Fundamental risk: {change_pct:.1f}% drop + negative news "
+            f"\u2192 score {_FUNDAMENTAL_RISK_PENALTY:+d} "
+            f"({catalyst_snippet})"
+        ]
+        logger.warning(
+            "[NewsNode] \u26a0 Fundamental risk — %s: drop=%.1f%%  negative news  "
+            "score %+d \u2192 %+d  (falling knife guard)",
+            ticker, change_pct, old_score, new_score,
+        )
+
+    return state
+
+
 class NewsNode:
     """
     LangGraph node: fetch headlines + LLM sentiment for each candidate ticker.
@@ -181,4 +230,6 @@ class NewsNode:
                     summary["catalyst"][:70],
                 )
 
+        # After all sentiments are known, apply the falling-knife guardrail.
+        state = _apply_fundamental_risk_penalty(state)
         return state

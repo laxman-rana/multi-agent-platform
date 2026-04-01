@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.agents.opportunity.nodes.alpha_scanner_agent import _MAX_SECTOR_EXPOSURE, _MAX_POSITION_WEIGHT
+from src.agents.opportunity.nodes.alpha_scanner_agent import _MAX_SECTOR_EXPOSURE, _MAX_POSITION_WEIGHT, _MAX_CONCURRENT_BUYS
 from src.agents.opportunity.engines.decision_agent import OpportunityDecisionAgent
 from src.agents.opportunity.state import OpportunityState
 from src.llm import get_provider, infer_provider
@@ -63,6 +63,14 @@ class DecisionNode:
         sector_allocation: Dict[str, float] = portfolio_context.get("sector_allocation", {})
         position_weights:  Dict[str, float] = portfolio_context.get("position_weights", {})
         cash_available:    float            = portfolio_context.get("cash_available", float("inf"))
+
+        # Suggested position size: spread available cash evenly across the max
+        # concurrent buy slots.  None when capital is unconstrained.
+        suggested_position_size: Optional[float] = (
+            cash_available / _MAX_CONCURRENT_BUYS
+            if cash_available < float("inf") and cash_available > 0
+            else None
+        )
 
         approved_candidates = state.candidates
         now_iso      = datetime.now(timezone.utc).isoformat()
@@ -167,6 +175,10 @@ class DecisionNode:
                 continue
 
             state.recent_signals[ticker] = now_iso
+            state.recent_signal_context[ticker] = {
+                "price": mkt.get("price", 0.0),
+                "score": signal_result["score"],
+            }
 
             # ── portfolio concentration warnings ──────────────────────────
             portfolio_warnings: List[str] = []
@@ -242,12 +254,13 @@ class DecisionNode:
             news_sent = state.news_sentiment.get(ticker, {})
             buy_entry = {
                 "ticker":                ticker,
-                "action":                "BUY",
+                "action":                "BUY SIGNAL",
                 "confidence":            decision["confidence"],
                 "entry_quality":         decision["entry_quality"],
                 "reason":                decision["reason"],
                 "type":                  decision["type"],
                 "score":                 signal_result["score"],
+                "opportunity_score":     signal_result.get("opportunity_score"),
                 "signals":               signal_result["signals"],
                 "sector":                sector,
                 "current_position_pct":  current_position,
@@ -256,6 +269,7 @@ class DecisionNode:
                 "portfolio_hints":       portfolio_hints,
                 "news_sentiment":        news_sent.get("sentiment", "neutral"),
                 "news_catalyst":         news_sent.get("catalyst", ""),
+                "suggested_position_size": suggested_position_size,
             }
             state.buy_opportunities.append(buy_entry)
 
@@ -294,9 +308,17 @@ class DecisionNode:
         state.buy_opportunities.sort(
             key=lambda x: (
                 _CONFIDENCE_RANK.get(x["confidence"], 99),
-                -(x["score"] + _fit_boost(x)),
+                -(x.get("opportunity_score") or 0.0) - _fit_boost(x),
             )
         )
+
+        # Cap to max concurrent positions — highest-conviction setups only.
+        if len(state.buy_opportunities) > _MAX_CONCURRENT_BUYS:
+            logger.info(
+                "[DecisionNode] %d BUY signals → capping to top %d (max_concurrent_buys)",
+                len(state.buy_opportunities), _MAX_CONCURRENT_BUYS,
+            )
+            state.buy_opportunities = state.buy_opportunities[:_MAX_CONCURRENT_BUYS]
 
         # ── scan summary telemetry ─────────────────────────────────────────
         total_ms = round((time.monotonic() - node_t0) * 1000, 1)

@@ -18,12 +18,19 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Module-level constants — override by subclassing if needed.
 # ---------------------------------------------------------------------------
-_COOLDOWN_MINUTES:    int   = 30
-_COOLDOWN_UNIT:       str   = "minutes"  # "minutes" | "hours" | "days"
-_CANDIDATE_MIN_SCORE: int   = 1
-_MAX_SECTOR_EXPOSURE: float = 60.0
-_MAX_POSITION_WEIGHT: float = 10.0
-_MAX_FETCH_WORKERS:   int   = 10
+_COOLDOWN_MINUTES:        int   = 30
+_COOLDOWN_UNIT:           str   = "minutes"  # "minutes" | "hours" | "days"
+_CANDIDATE_MIN_SCORE:     int   = 2   # score must be ≥2 ("buy" tier) to reach LLM
+_MAX_SECTOR_EXPOSURE:     float = 60.0
+_MAX_POSITION_WEIGHT:     float = 10.0
+_MAX_FETCH_WORKERS:       int   = 10
+# Event-override: bypass score gate for extreme moves near the 52-week low.
+# These are potential crash-dip / panic-selling / earnings-reaction setups
+# that a pure score filter would silently discard.
+_EVENT_OVERRIDE_MIN_MOVE: float = 8.0   # abs(change_pct) threshold (%)
+_EVENT_OVERRIDE_52W_BAND: float = 0.30  # price within lower 30% of 52w range
+_MAX_CONCURRENT_BUYS:     int   = 3     # max new positions to open per scan cycle
+_MAX_SIGNAL_SCORE:        float = 5.0   # theoretical max raw signal score (normalization denominator)
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +102,30 @@ def _fetch_extended(ticker: str) -> Dict[str, Any]:
 # Cooldown helper
 # ---------------------------------------------------------------------------
 
+def _is_event_override(mdata: Dict[str, Any]) -> bool:
+    """
+    Return True when a ticker qualifies for an event override regardless of
+    its quantitative score.  Criteria (both must hold):
+      1. abs(change_pct) >= _EVENT_OVERRIDE_MIN_MOVE (default 8%) — large
+         intraday move signalling a potential crash-dip or earnings reaction.
+      2. Price is within the lower _EVENT_OVERRIDE_52W_BAND of its 52-week
+         range (default: lower 30%) — mean-reversion entry zone.
+    These stocks are forwarded to the LLM with override_reason="extreme_move"
+    so the model can apply discretion rather than being silently ignored.
+    """
+    change_pct = mdata.get("change_pct", 0.0)
+    price      = mdata.get("price", 0.0)
+    high_52w   = mdata.get("52w_high", 0.0)
+    low_52w    = mdata.get("52w_low",  0.0)
+
+    if abs(change_pct) < _EVENT_OVERRIDE_MIN_MOVE:
+        return False
+    if not (high_52w and low_52w and high_52w > low_52w):
+        return False
+    range_pct = (price - low_52w) / (high_52w - low_52w)
+    return range_pct <= _EVENT_OVERRIDE_52W_BAND
+
+
 def _is_cooled_down(ticker: str, recent_signals: Dict[str, str]) -> bool:
     """
     Return True when the ticker has NOT emitted a BUY signal within the
@@ -117,6 +148,96 @@ def _is_cooled_down(ticker: str, recent_signals: Dict[str, str]) -> bool:
         return (elapsed / 60) >= _COOLDOWN_MINUTES   # default: minutes
     except (ValueError, TypeError):
         return True
+
+
+def _is_fresh_despite_cooldown(
+    ticker: str,
+    mdata: Dict[str, Any],
+    recent_signal_context: Dict[str, Any],
+) -> bool:
+    """
+    Return True when the ticker is within its cooldown window but a new
+    material catalyst has emerged since the last BUY signal was emitted:
+
+      1. Capitulation event (drop ≥8% on ≥3× avg volume): panic-selling
+         exhaustion is always a fresh setup regardless of signal recency.
+      2. Significant new dip: price has fallen ≥5% since the price recorded
+         at last signal, opening a new lower entry zone.
+    """
+    from src.agents.opportunity.engines.signal_engine import _THRESHOLDS  # noqa: PLC0415
+    change_pct = mdata.get("change_pct", 0.0)
+    volume     = mdata.get("volume", 0)
+    avg_volume = mdata.get("avg_volume", 0)
+
+    # Capitulation always warrants re-evaluation regardless of cooldown.
+    if (
+        change_pct <= -_THRESHOLDS["capitulation_move_pct"]
+        and avg_volume > 0
+        and volume / avg_volume >= _THRESHOLDS["capitulation_vol_ratio"]
+    ):
+        return True
+
+    # Significant new dip since the last signal price.
+    ctx = recent_signal_context.get(ticker)
+    if ctx:
+        prev_price = ctx.get("price", 0.0)
+        curr_price = mdata.get("price", 0.0)
+        if prev_price > 0 and curr_price > 0:
+            drop_since_pct = (curr_price - prev_price) / prev_price * 100
+            if drop_since_pct <= -5.0:
+                return True
+
+    return False
+
+
+def _compute_opportunity_score(
+    ticker: str,
+    mdata: Dict[str, Any],
+    signal: Dict[str, Any],
+    recent_signal_context: Dict[str, Any],
+) -> float:
+    """
+    Composite ranking metric that blends four orthogonal dimensions:
+
+      0.4 × normalized_signal_score   raw_score / _MAX_SIGNAL_SCORE → [0, 1]
+      0.3 × analyst_upside            analyst mean-target upside, 50% upside = 1.0
+      0.2 × volume_spike              volume / avg_volume ratio, 10× = 1.0
+      0.1 × freshness                 1.0 = brand-new idea, 0.0 = recently acted on
+
+    All components are clamped to [0, 1] before weighting so a single extreme
+    value cannot dominate the composite.  Returns a float in [0.0, 1.0].
+    """
+    # Component 1: signal strength (normalized)
+    raw_score  = signal.get("score", 0)
+    norm_score = max(0.0, min(1.0, raw_score / _MAX_SIGNAL_SCORE))
+
+    # Component 2: analyst upside (normalized: 50% upside → 1.0)
+    analyst_target = mdata.get("analyst_target")
+    price          = mdata.get("price", 0.0)
+    if analyst_target and price and price > 0:
+        upside              = (float(analyst_target) - price) / price
+        analyst_upside_norm = min(1.0, max(0.0, upside / 0.5))
+    else:
+        analyst_upside_norm = 0.0
+
+    # Component 3: volume spike (normalized: 10× avg volume → 1.0)
+    volume     = mdata.get("volume", 0)
+    avg_volume = mdata.get("avg_volume", 0)
+    if avg_volume and avg_volume > 0:
+        volume_spike_norm = min(1.0, (volume / avg_volume) / 10.0)
+    else:
+        volume_spike_norm = 0.0
+
+    # Component 4: freshness (1.0 = never signalled before, 0.0 = recently acted on)
+    freshness = 0.0 if ticker in recent_signal_context else 1.0
+
+    return round(
+        0.4 * norm_score
+        + 0.3 * analyst_upside_norm
+        + 0.2 * volume_spike_norm
+        + 0.1 * freshness,
+        4,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -247,35 +368,87 @@ class AlphaScannerAgent:
         )
 
         # ------------------------------------------------------------------
-        # Step 5: Candidate filter — score >= _CANDIDATE_MIN_SCORE AND cooldown clear
+        # Step 5: Candidate filter — score >= _CANDIDATE_MIN_SCORE  OR  event
+        #         override (large intraday move + price near 52-week low).
+        # Event overrides are tagged with signal["override_reason"] so the
+        # LLM and display layer receive the full context.
         # ------------------------------------------------------------------
         candidates:       List[str] = []
         skipped_cooldown: List[str] = []
+        event_overrides:  List[str] = []
 
-        for ticker, signal in state.signals.items():
-            if signal["score"] < _CANDIDATE_MIN_SCORE:
-                continue
+        # Sort score-qualified tickers by opportunity_score descending — highest
+        # conviction first.  Ranking before the cooldown gate ensures the best
+        # setups always reach the LLM ahead of marginal ones, regardless of dict
+        # iteration order.  opportunity_score blends signal strength, analyst
+        # upside, volume spike, and idea freshness into a single composite rank.
+        _qualified = [
+            (ticker, sig)
+            for ticker, sig in state.signals.items()
+            if sig["score"] >= _CANDIDATE_MIN_SCORE
+            or _is_event_override(state.market_data.get(ticker, {}))
+        ]
+        for ticker, sig in _qualified:
+            sig["opportunity_score"] = _compute_opportunity_score(
+                ticker,
+                state.market_data.get(ticker, {}),
+                sig,
+                state.recent_signal_context,
+            )
+
+        scored_queue = sorted(
+            _qualified,
+            key=lambda x: x[1]["opportunity_score"],
+            reverse=True,
+        )
+
+        for ticker, signal in scored_queue:
+            mdata       = state.market_data.get(ticker, {})
+            is_override = _is_event_override(mdata)
+
             if not _is_cooled_down(ticker, state.recent_signals):
-                skipped_cooldown.append(ticker)
-                logger.info("[AlphaScannerAgent] %s skipped — cooldown active", ticker)
-                continue
+                # Freshness bypass: a new capitulation or significant price drop
+                # re-opens the ticker for re-evaluation even within cooldown.
+                if _is_fresh_despite_cooldown(ticker, mdata, state.recent_signal_context):
+                    logger.info(
+                        "[AlphaScannerAgent] %s — cooldown bypassed: fresh catalyst (%.1f%%)",
+                        ticker, mdata.get("change_pct", 0.0),
+                    )
+                    signal["override_reason"] = signal.get("override_reason") or "fresh_catalyst"
+                else:
+                    skipped_cooldown.append(ticker)
+                    logger.info("[AlphaScannerAgent] %s skipped — cooldown active", ticker)
+                    continue
+
+            if is_override and signal["score"] < _CANDIDATE_MIN_SCORE:
+                signal["override_reason"] = "extreme_move"
+                event_overrides.append(ticker)
+                logger.info(
+                    "[AlphaScannerAgent] %s — event override: %.1f%% move near 52w low",
+                    ticker, mdata.get("change_pct", 0.0),
+                )
+
             candidates.append(ticker)
 
         state.candidates = candidates
+        state.skipped_cooldown = list(skipped_cooldown)
+        state.blocked_no_cash = []
 
         telemetry.log_event(
             "candidates_filtered",
             {
-                "candidate_count":   len(candidates),
-                "filtered_count":    len(state.signals) - len(candidates) - len(skipped_cooldown),
-                "skipped_cooldown":  skipped_cooldown,
+                "candidate_count":  len(candidates),
+                "filtered_count":   len(state.signals) - len(candidates) - len(skipped_cooldown),
+                "skipped_cooldown": skipped_cooldown,
+                "event_overrides":  event_overrides,
             },
         )
         logger.info(
             "[AlphaScannerAgent] %d candidates after score + cooldown filter  "
-            "(%d on cooldown)",
+            "(%d on cooldown, %d event overrides)",
             len(candidates),
             len(skipped_cooldown),
+            len(event_overrides),
         )
 
         # ------------------------------------------------------------------
@@ -285,16 +458,23 @@ class AlphaScannerAgent:
         position_weights:  Dict[str, float] = portfolio_context.get("position_weights", {})
         cash_available:    float            = portfolio_context.get("cash_available", float("inf"))
 
-        if cash_available <= 0:
+        if cash_available <= 0 and not state.ignore_cash_check:
             logger.warning(
                 "[AlphaScannerAgent] cash_available=%.2f — no capital deployable; "
-                "skipping all LLM decisions",
+                "skipping all LLM decisions  (pass ignore_cash_check=True to override)",
                 cash_available,
             )
             telemetry.log_event(
                 "candidates_filtered",
-                {"skipped_reason": "no_cash", "skipped_count": len(candidates)},
+                {"skipped_reason": "no_cash", "skipped_count": len(candidates) + len(skipped_cooldown)},
             )
+            # All score-qualified tickers — both candidates and cooldown-suppressed —
+            # are reported as blocked_no_cash.  Cash was the real blocking factor;
+            # the cooldown distinction is irrelevant when there is nothing to deploy.
+            state.blocked_no_cash = list(candidates) + list(skipped_cooldown)
+            state.skipped_cooldown = []   # reclassified: no-cash drove suppression
+            # Clear candidates so NewsNode and DecisionNode are no-ops.
+            state.candidates = []
             state.buy_opportunities = []
             return state
 

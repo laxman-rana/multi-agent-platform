@@ -23,7 +23,7 @@ Three agents are currently implemented:
 
 - **E-commerce support agent** — LangGraph-based customer support workflow with tool-calling (refunds, messaging)
 - **Portfolio analysis agent** — LangGraph multi-agent pipeline that analyses an investor's equity portfolio using live market data and an LLM to produce hold/reduce/exit/double-down recommendations with actionable allocation changes
-- **Opportunity scanner agent** — 3-node LangGraph pipeline that scans live equity markets (US S&P 500, NIFTY 50/MIDCAP 100/SMALLCAP 100) for high-quality BUY entries using deterministic signals, news sentiment, analyst consensus, and volume pressure
+- **Opportunity scanner agent** — 3-node LangGraph pipeline that scans live equity markets (US S&P 500, NIFTY 50/MIDCAP 100/SMALLCAP 100) for high-quality BUY signals using a composite opportunity score (signal strength, analyst upside, volume spike, idea freshness), news sentiment, and LLM verdict
 
 The goal is to use the same shared foundation for additional agents such as fulfillment, finance, operations, HR, or other domain-specific assistants.
 
@@ -125,15 +125,16 @@ See [src/agents/portfolio/README.md](src/agents/portfolio/README.md) for full do
 
 ### Opportunity scanner agent
 
-| Flag         | Type    | Description                                                 |
-| ------------ | ------- | ----------------------------------------------------------- |
-| `--tickers`  | `str …` | Explicit list of ticker symbols to scan                     |
-| `--top-n`    | `int`   | Scan top-N most liquid tickers from the built-in universe   |
-| `--market`   | `str`   | Market universe: `US` (default), `IN`, `IN_MID`, `IN_SMALL` |
-| `--interval` | `int`   | Minutes between scans in continuous mode (default: 15)      |
-| `--once`     | flag    | Run a single scan and exit instead of looping               |
-| `--model`    | `str`   | Override the LLM model (provider auto-inferred)             |
-| `--verbose`  | flag    | Print per-ticker prefilter debug output                     |
+| Flag             | Type    | Description                                                             |
+| ---------------- | ------- | ----------------------------------------------------------------------- |
+| `--tickers`      | `str …` | Explicit list of ticker symbols to scan                                 |
+| `--top-n`        | `int`   | Scan top-N most liquid tickers from the built-in universe               |
+| `--market`       | `str`   | Market universe: `US` (default), `IN`, `IN_MID`, `IN_SMALL`             |
+| `--interval`     | `int`   | Minutes between scans in continuous mode (default: 15)                  |
+| `--once`         | flag    | Run a single scan and exit instead of looping                           |
+| `--model`        | `str`   | Override the LLM model (provider auto-inferred)                         |
+| `--verbose`      | flag    | Print per-ticker pipeline digest table after the scan                   |
+| `--enforce-cash` | flag    | Block all signals when portfolio cash ≤ 0 (default: off — always scans) |
 
 Either `--tickers` or `--top-n` is required. `--once` is recommended outside market hours.
 

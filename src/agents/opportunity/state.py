@@ -36,6 +36,18 @@ class OpportunityState:
     # Tickers with score >= 1 and a clear cooldown window
     candidates: List[str] = field(default_factory=list)
 
+    # Tickers that passed score but were suppressed by cooldown in the scanner.
+    skipped_cooldown: List[str] = field(default_factory=list)
+
+    # Tickers that passed score+cooldown but were blocked because no deployable
+    # capital was available in the portfolio context.
+    blocked_no_cash: List[str] = field(default_factory=list)
+
+    # When True (default), the zero-cash guard is bypassed so the scan produces
+    # BUY signals regardless of portfolio cash balance.  Set to False to enforce
+    # the hard stop (useful in live-trading mode where capital is limited).
+    ignore_cash_check: bool = True
+
     # LLM output per candidate ticker: {action, confidence, entry_quality, reason, type, score}
     decisions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
@@ -52,3 +64,9 @@ class OpportunityState:
     # Cooldown tracker: ticker -> ISO-format UTC timestamp of last emitted BUY signal.
     # Preserved across batch-scan iterations; reset only on process restart.
     recent_signals: Dict[str, str] = field(default_factory=dict)
+
+    # Price and score captured at the time each BUY signal was emitted.
+    # Used by the freshness bypass: if price has dropped ≥5% since the last
+    # signal, or a new capitulation event fires, the cooldown is lifted so a
+    # new lower entry zone can be re-evaluated.
+    recent_signal_context: Dict[str, Any] = field(default_factory=dict)
