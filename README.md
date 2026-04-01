@@ -1,5 +1,22 @@
 # Agents Project
 
+> ⚠️ **EDUCATIONAL USE ONLY — NOT FINANCIAL ADVICE**
+>
+> This project is built strictly for learning, research, and demonstration purposes.
+> Nothing in this repository constitutes financial advice, investment advice, trading
+> recommendations, or any other type of professional advice. The buy/sell signals,
+> scores, and opportunity outputs produced by these agents are **not** recommendations
+> to buy or sell any financial instrument.
+>
+> **Do not use this software to make real investment or trading decisions.**
+> Past signal quality is not indicative of future results. Always consult a qualified
+> financial adviser before making any investment decision.
+>
+> The authors and contributors of this project accept **no liability** for any financial
+> loss or damage arising from the use, misuse, or inability to use this software.
+
+---
+
 This repository hosts multiple AI agents across different business domains. It provides a shared Python package layout for agent implementations, LLM providers, observability integrations, and agent-specific tools.
 
 Three agents are currently implemented:
