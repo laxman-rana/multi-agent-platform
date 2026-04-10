@@ -125,16 +125,15 @@ See [src/agents/portfolio/README.md](src/agents/portfolio/README.md) for full do
 
 ### Opportunity scanner agent
 
-| Flag             | Type    | Description                                                             |
-| ---------------- | ------- | ----------------------------------------------------------------------- |
-| `--tickers`      | `str …` | Explicit list of ticker symbols to scan                                 |
-| `--top-n`        | `int`   | Scan top-N most liquid tickers from the built-in universe               |
-| `--market`       | `str`   | Market universe: `US` (default), `IN`, `IN_MID`, `IN_SMALL`             |
-| `--interval`     | `int`   | Minutes between scans in continuous mode (default: 15)                  |
-| `--once`         | flag    | Run a single scan and exit instead of looping                           |
-| `--model`        | `str`   | Override the LLM model (provider auto-inferred)                         |
-| `--verbose`      | flag    | Print per-ticker pipeline digest table after the scan                   |
-| `--enforce-cash` | flag    | Block all signals when portfolio cash ≤ 0 (default: off — always scans) |
+| Flag         | Type    | Description                                                 |
+| ------------ | ------- | ----------------------------------------------------------- |
+| `--tickers`  | `str …` | Explicit list of ticker symbols to scan                     |
+| `--top-n`    | `int`   | Scan top-N most liquid tickers from the built-in universe   |
+| `--market`   | `str`   | Market universe: `US` (default), `IN`, `IN_MID`, `IN_SMALL` |
+| `--interval` | `int`   | Minutes between scans in continuous mode (default: 15)      |
+| `--once`     | flag    | Run a single scan and exit instead of looping               |
+| `--model`    | `str`   | Override the LLM model (provider auto-inferred)             |
+| `--verbose`  | flag    | Print per-ticker pipeline digest table after the scan       |
 
 Either `--tickers` or `--top-n` is required. `--once` is recommended outside market hours.
 

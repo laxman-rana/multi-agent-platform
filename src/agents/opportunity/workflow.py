@@ -33,15 +33,11 @@ from typing import Any, Dict, List, Optional
 
 from langgraph.graph import END, StateGraph
 
-from src.agents.opportunity.nodes.alpha_scanner_agent import AlphaScannerAgent, _MAX_CONCURRENT_BUYS
+from src.agents.opportunity.nodes.alpha_scanner_agent import AlphaScannerAgent
 from src.agents.opportunity.nodes.news_node import NewsNode
 from src.agents.opportunity.nodes.decision_node import DecisionNode
 from src.agents.opportunity.markets.market_strategy import get_liquid_universe, get_market_strategy
 from src.agents.opportunity.state import OpportunityState
-from src.agents.portfolio.state import PortfolioState
-from src.agents.portfolio.subagents.portfolio_agent import PortfolioAgent
-from src.agents.portfolio.subagents.market_agent import MarketAgent
-from src.agents.portfolio.subagents.risk_agent import RiskAgent
 from src.observability import get_telemetry_logger
 
 logger = logging.getLogger(__name__)
@@ -59,64 +55,6 @@ def is_market_open(market: str = "US") -> bool:
     IN : NSE (India)  Mon–Fri 09:15–15:30 IST
     """
     return get_market_strategy(market).is_open()
-
-
-# ---------------------------------------------------------------------------
-# Portfolio context builder
-# ---------------------------------------------------------------------------
-
-def _fetch_portfolio_context() -> Dict[str, Any]:
-    """
-    Fetch live portfolio data from PortfolioAgent and RiskAgent.
-    
-    Builds a portfolio_context dict with:
-      - position_weights: ticker → % of portfolio
-      - sector_allocation: sector → % of portfolio  
-      - cash_available: float (deployable capital)
-      
-    Returns empty dict if portfolio agent fails, allowing scan to continue.
-    """
-    try:
-        # Initialize empty portfolio state
-        port_state = PortfolioState()
-        
-        # Run PortfolioAgent to load positions
-        port_agent = PortfolioAgent()
-        port_state = port_agent.run(port_state)
-        
-        # Run MarketAgent to fetch live prices — required so RiskAgent
-        # computes allocation % from real market values, not avg_cost.
-        # Without this, a 15-share MSFT position at $403 avg_cost looks
-        # ~40% of portfolio instead of its true current-price weighting.
-        market_agent = MarketAgent()
-        port_state = market_agent.run(port_state)
-        
-        # Run RiskAgent to compute allocations
-        risk_agent = RiskAgent()
-        port_state = risk_agent.run(port_state)
-        
-        # Extract portfolio context from state
-        sector_alloc = port_state.sector_allocation or {}
-        stock_alloc = port_state.risk_metrics.get("stock_allocation", {}) if port_state.risk_metrics else {}
-        cash_avail = port_state.risk_metrics.get("cash_balance", 0.0) if port_state.risk_metrics else 0.0
-
-        portfolio_context = {
-            "position_weights": stock_alloc,
-            "sector_allocation": sector_alloc,
-            "cash_available": cash_avail,
-        }
-        
-        logger.info(
-            "[Portfolio] Loaded %d positions, %d sectors, cash=%.0f",
-            len(stock_alloc), len(sector_alloc), cash_avail
-        )
-        return portfolio_context
-        
-    except Exception as exc:
-        logger.warning(
-            "[Portfolio] Failed to fetch portfolio context: %s. Continuing with empty portfolio.", exc
-        )
-        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +88,6 @@ def build_graph():
 
 def trigger_scan(
     tickers: Optional[List[str]] = None,
-    portfolio_context: Optional[Dict[str, Any]] = None,
     top_n: Optional[int] = None,
     market: str = "US",
 ) -> List[Dict[str, Any]]:
@@ -160,13 +97,11 @@ def trigger_scan(
 
     Parameters
     ----------
-    tickers           : explicit list of ticker symbols; if None and top_n is
-                        set, the dynamic liquid universe is used instead.
-    portfolio_context : optional dict with sector_allocation, position_weights,
-                        cash_available, total_positions, top_holding_weight
-    top_n             : when tickers is None, scan the top-N most liquid tickers
-                        from the built-in universe (default: 200).
-    market            : "US" for S&P 500 / NYSE (default), "IN" for NIFTY 50 / NSE.
+    tickers : explicit list of ticker symbols; if None and top_n is
+              set, the dynamic liquid universe is used instead.
+    top_n   : when tickers is None, scan the top-N most liquid tickers
+              from the built-in universe (default: 200).
+    market  : "US" for S&P 500 / NYSE (default), "IN" for NIFTY 50 / NSE.
 
     Returns
     -------
@@ -174,10 +109,7 @@ def trigger_scan(
     """
     resolved_tickers = tickers or get_liquid_universe(top_n or 200, market)
     compiled      = build_graph()
-    initial_state = OpportunityState(
-        watchlist=resolved_tickers,
-        portfolio_context=portfolio_context or {},
-    )
+    initial_state = OpportunityState(watchlist=resolved_tickers)
     result      = compiled.invoke(initial_state)
     final_state = result if isinstance(result, OpportunityState) else OpportunityState(**result)
     return final_state.buy_opportunities
@@ -185,11 +117,9 @@ def trigger_scan(
 
 def run_batch_scan(
     tickers: Optional[List[str]] = None,
-    portfolio_context: Optional[Dict[str, Any]] = None,
     interval_minutes: int = 15,
     top_n: Optional[int] = None,
     market: str = "US",
-    ignore_cash_check: bool = True,
 ) -> None:
     """
     Repeated batch scan that runs continuously while the market is open.
@@ -217,10 +147,8 @@ def run_batch_scan(
     while is_market_open(market):
         state_input = OpportunityState(
             watchlist=resolved_tickers,
-            portfolio_context=portfolio_context or {},
             recent_signals=dict(recent_signals),          # shallow copy preserves cooldown
             recent_signal_context=dict(recent_signal_context),  # preserves freshness context
-            ignore_cash_check=ignore_cash_check,
         )
 
         result = compiled.invoke(state_input)
@@ -264,14 +192,12 @@ def run_batch_scan(
 
 def main(
     tickers: Optional[List[str]] = None,
-    portfolio_context: Optional[Dict[str, Any]] = None,
     interval_minutes: int = 15,
     model: Optional[str] = None,
     once: bool = False,
     top_n: Optional[int] = None,
     market: str = "US",
     verbose: bool = False,
-    ignore_cash_check: bool = True,
 ) -> None:
     from src.llm.providers import _DEFAULT_MODELS, infer_provider
 
@@ -313,20 +239,15 @@ def main(
         print("[Error] Provide --tickers AAPL MSFT or --top-n N to scan the liquid universe")
         raise SystemExit(1)
 
-    # Fetch portfolio context if not explicitly provided
-    if not portfolio_context:
-        logger.info("Fetching portfolio context from PortfolioAgent...")
-        portfolio_context = _fetch_portfolio_context()
-
     try:
         if once:
-            final_state = _trigger_scan_full(tickers, portfolio_context, top_n, market, ignore_cash_check)
+            final_state = _trigger_scan_full(tickers, top_n, market)
             _print_opportunities(final_state.buy_opportunities)
             _print_ignored(final_state)
             if verbose:
                 _print_scan_digest(final_state)
         else:
-            run_batch_scan(tickers, portfolio_context, interval_minutes, top_n, market, ignore_cash_check)
+            run_batch_scan(tickers, interval_minutes, top_n, market)
 
     except ValueError as exc:
         logger.error("Configuration error: %s", exc)
@@ -373,19 +294,13 @@ def _prefilter_fail_reasons(mdata: Dict[str, Any]) -> str:
 
 def _trigger_scan_full(
     tickers: Optional[List[str]] = None,
-    portfolio_context: Optional[Dict[str, Any]] = None,
     top_n: Optional[int] = None,
     market: str = "US",
-    ignore_cash_check: bool = True,
 ) -> "OpportunityState":
     """Same as trigger_scan but returns the full OpportunityState for diagnostics."""
     resolved_tickers = tickers or get_liquid_universe(top_n or 200, market)
     compiled      = build_graph()
-    initial_state = OpportunityState(
-        watchlist=resolved_tickers,
-        portfolio_context=portfolio_context or {},
-        ignore_cash_check=ignore_cash_check,
-    )
+    initial_state = OpportunityState(watchlist=resolved_tickers)
     result = compiled.invoke(initial_state)
     return result if isinstance(result, OpportunityState) else OpportunityState(**result)
 
@@ -429,10 +344,6 @@ def _print_scan_digest(state: "OpportunityState") -> None:
         if sig["score"] < _CANDIDATE_MIN_SCORE and not sig.get("override_reason"):
             stage = "\u274c SCORE TOO LOW"
             print(f"  {ticker:<12}  {stage:<20}  {score_str:<14}  score < {_CANDIDATE_MIN_SCORE}, not sent to LLM")
-            continue
-        if ticker in state.blocked_no_cash:
-            stage = "\ud83d\udcb0 NO CASH"
-            print(f"  {ticker:<12}  {stage:<20}  {score_str:<14}  no deployable capital, not sent to LLM")
             continue
         if ticker in state.skipped_cooldown:
             stage = "\u23f3 ON COOLDOWN"
@@ -601,7 +512,6 @@ def _print_ignored(state: "OpportunityState") -> None:
     llm_ignored: list = []      # reached LLM → IGNORE
     low_score: list   = []      # signals fired but score < minimum threshold
     on_cooldown: list = []      # score OK but suppressed by cooldown
-    no_cash: list = []          # score OK but blocked because cash_available <= 0
     prefilter_fail: list = []   # failed prefilter (no significant activity)
     errors: list = []           # data fetch or signal error
 
@@ -619,9 +529,6 @@ def _print_ignored(state: "OpportunityState") -> None:
         score = sig.get("score", 0)
         if score < _CANDIDATE_MIN_SCORE and not sig.get("override_reason"):
             low_score.append((ticker, sig))
-            continue
-        if ticker in state.blocked_no_cash:
-            no_cash.append((ticker, sig))
             continue
         if ticker in state.skipped_cooldown:
             on_cooldown.append((ticker, sig))
@@ -655,18 +562,6 @@ def _print_ignored(state: "OpportunityState") -> None:
         print(f"\n  [ Passed activity filter but signal score too low (< {_CANDIDATE_MIN_SCORE}): {len(low_score)} ]")
         for ticker, sig in low_score:
             _print_ticker_detail(ticker, sig, state, reason=_build_low_score_reason(ticker, sig, state))
-
-    if no_cash:
-        no_cash.sort(key=lambda x: x[1].get("score", 0), reverse=True)
-        cash_available = state.portfolio_context.get("cash_available", 0.0)
-        print(f"\n  [ Score meets threshold but blocked by no deployable capital: {len(no_cash)} ]")
-        for ticker, sig in no_cash:
-            _print_ticker_detail(
-                ticker,
-                sig,
-                state,
-                reason=f"No deployable capital available (cash=${cash_available:,.0f}) — not sent to LLM.",
-            )
 
     if on_cooldown:
         on_cooldown.sort(key=lambda x: x[1].get("score", 0), reverse=True)
@@ -705,23 +600,18 @@ def _print_opportunities(opportunities: List[Dict[str, Any]]) -> None:
         return
 
     for opp in opportunities:
-        ticker       = opp["ticker"]
-        score        = opp["score"]
-        opp_score    = opp.get("opportunity_score")
-        tier         = opp.get("tier", "")
-        confidence   = opp["confidence"]
+        ticker        = opp["ticker"]
+        score         = opp["score"]
+        opp_score     = opp.get("opportunity_score")
+        tier          = opp.get("tier", "")
+        confidence    = opp["confidence"]
         entry_quality = opp["entry_quality"]
-        otype        = opp["type"]
-        reason       = opp["reason"]
-        sector       = opp.get("sector", "Unknown")
-        current_pos  = opp.get("current_position_pct", 0.0)
-        sector_alloc = opp.get("sector_allocation_pct", 0.0)
-        pos_size     = opp.get("suggested_position_size")
-        news_sent    = opp.get("news_sentiment", "N/A").upper()
-        news_cat     = opp.get("news_catalyst", "")
-        signals      = opp.get("signals", [])
-        warnings     = opp.get("portfolio_warnings", [])
-        hints        = opp.get("portfolio_hints", [])
+        otype         = opp["type"]
+        reason        = opp["reason"]
+        sector        = opp.get("sector", "Unknown")
+        news_sent     = opp.get("news_sentiment", "N/A").upper()
+        news_cat      = opp.get("news_catalyst", "")
+        signals       = opp.get("signals", [])
 
         # ── Section 1: signal header ──────────────────────────────────────
         print(f"\n{heavy}")
@@ -737,7 +627,7 @@ def _print_opportunities(opportunities: List[Dict[str, Any]]) -> None:
             f"  Score         : {score:+d}"
             + (f"  {opp_score_line}" if opp_score is not None else "") + "\n"
             f"  Type          : {otype}\n"
-            f"  Sector        : {sector}  (held: {current_pos:.1f}%  |  sector alloc: {sector_alloc:.1f}%)\n"
+            f"  Sector        : {sector}\n"
         )
 
         # News
@@ -753,54 +643,15 @@ def _print_opportunities(opportunities: List[Dict[str, Any]]) -> None:
         # Reason block
         print(f"\n  Reason:\n  {reason}\n")
 
-        # ── Section 2: portfolio constraints ─────────────────────────────
-        print(light)
-        print("PORTFOLIO CONSTRAINTS (Advisory)")
-        print(light)
-
-        if not warnings and not hints:
-            print("\n  No portfolio constraints detected.\n")
-        else:
-            if warnings:
-                print()
-                for w in warnings:
-                    print(f"  {w}")
-            if hints:
-                print()
-                for h in hints:
-                    print(f"  {h}")
-            print()
-
-        # ── Section 3: execution status ───────────────────────────────────
+        # ── Section 2: execution status ───────────────────────────────────
         print(light)
         print("EXECUTION STATUS")
         print(light)
 
-        # Actionable = no blocking warnings AND capital available
-        has_cap_warning = any(
-            kw in w for w in warnings
-            for kw in ("POSITION CAP", "SECTOR CAP", "LIMITED CAPITAL")
-        )
-        actionable = not has_cap_warning
-
-        print(f"\n  Actionable    : {'YES' if actionable else 'NO'}\n")
-        if pos_size is not None:
-            print(f"  Suggested size: ${pos_size:,.0f}  (cash ÷ {_MAX_CONCURRENT_BUYS} max buys)")
-
+        print(f"\n  Actionable    : YES\n")
         print("\n  Suggested Actions:")
-        if actionable:
-            print(f"      - Execute BUY for {ticker}")
-            if pos_size is not None:
-                print(f"      - Limit position to ${pos_size:,.0f}")
-            print(f"      - Set stop-loss below 52-week low")
-        else:
-            if any("POSITION CAP" in w for w in warnings):
-                print(f"      - Consider trimming existing {ticker} position first")
-            if any("SECTOR CAP" in w for w in warnings):
-                print(f"      - Rebalance {sector} sector exposure before adding")
-            if any("LIMITED CAPITAL" in w for w in warnings):
-                print(f"      - Deploy capital when available")
-            print(f"      - Add {ticker} to watchlist for next rebalance")
+        print(f"      - Execute BUY for {ticker}")
+        print(f"      - Set stop-loss below 52-week low")
         print()
 
     print(f"{heavy}\n")
@@ -878,16 +729,6 @@ if __name__ == "__main__":
         action="store_true",
         help="Run a single scan and exit (useful for testing outside market hours).",
     )
-    parser.add_argument(
-        "--enforce-cash",
-        action="store_true",
-        dest="enforce_cash",
-        help=(
-            "Enforce the zero-cash guard: skip all LLM decisions when "
-            "portfolio cash_available <= 0.  By default this guard is disabled "
-            "so the scan always runs regardless of available capital."
-        ),
-    )
 
     args = parser.parse_args()
     main(
@@ -898,5 +739,4 @@ if __name__ == "__main__":
         top_n=args.top_n,
         market=args.market,
         verbose=args.verbose,
-        ignore_cash_check=not args.enforce_cash,
     )

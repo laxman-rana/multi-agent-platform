@@ -7,9 +7,9 @@
 > Nothing it outputs constitutes financial advice or a recommendation to buy or sell any security.
 > **Do not use these signals to make real investment decisions.**
 
-A production-grade, event-driven three-stage agent that scans live market data during NYSE/NSE trading hours and surfaces high-quality **BUY** opportunities. It automatically integrates with `PortfolioAgent` to fetch your real holdings and emit actionable portfolio warnings alongside every recommendation. Each candidate also receives a news sentiment analysis before the final LLM decision.
+A production-grade, event-driven three-stage agent that scans live market data during NYSE/NSE trading hours and surfaces high-quality **BUY** opportunities. Each candidate receives a news sentiment analysis before the final LLM decision.
 
-> **Scope constraint:** This agent only ever outputs `BUY SIGNAL` or `IGNORE`. It has no concept of SELL, REDUCE, or EXIT — those decisions belong exclusively to `PortfolioAgent`.
+> **Scope constraint:** This agent only ever outputs `BUY SIGNAL` or `IGNORE`. It has no concept of SELL, REDUCE, or EXIT — those decisions belong exclusively to `PortfolioAgent`. The opportunity agent has no knowledge of your current holdings or portfolio context.
 
 ---
 
@@ -22,10 +22,9 @@ A production-grade, event-driven three-stage agent that scans live market data d
   - [2. PreFilterEngine](#2-prefilterengine)
   - [3. SignalEngine](#3-signalengine)
   - [4. Candidate Filter](#4-candidate-filter)
-  - [5. Portfolio-Awareness Guards](#5-portfolio-awareness-guards)
-  - [6. NewsNode — Sentiment Analysis](#6-newsnode--sentiment-analysis)
-  - [7. OpportunityDecisionAgent (LLM)](#7-opportunitydecisionagent-llm)
-  - [8. Sort and Emit](#8-sort-and-emit)
+  - [5. NewsNode — Sentiment Analysis](#5-newsnode--sentiment-analysis)
+  - [6. OpportunityDecisionAgent (LLM)](#6-opportunitydecisionagent-llm)
+  - [7. Sort and Emit](#7-sort-and-emit)
 - [State Object](#state-object)
 - [Output Format](#output-format)
 - [Observability & Telemetry](#observability--telemetry)
@@ -39,17 +38,12 @@ A production-grade, event-driven three-stage agent that scans live market data d
   - [Tuning Constants](#tuning-constants)
 - [Real-Time & Event-Driven Behavior](#real-time--event-driven-behavior)
 - [Design Decisions](#design-decisions)
-- [Integration with PortfolioAgent](#integration-with-portfolioagent)
 
 ---
 
 ## Architecture Overview
 
 ```
-PortfolioAgent + MarketAgent + RiskAgent   (auto-fetched on startup)
-        │
-        │  position_weights, sector_allocation, cash_available
-        ▼
 Watchlist (explicit --tickers  OR  get_liquid_universe(--top-n, market))
         │  US: up to 500 S&P 500 constituents
         │  IN / IN_MID / IN_SMALL: NIFTY 50 / MIDCAP 100 / SMALLCAP 100
@@ -59,28 +53,23 @@ Watchlist (explicit --tickers  OR  get_liquid_universe(--top-n, market))
         │   1. Parallel fetch              (_fetch_extended — 10 workers)
         │   2. PreFilter                   (OR-logic triage, zero LLM cost)
         │   3. SignalEngine                (8 weighted signals, deterministic)
-        │   4. Candidate filter            (score >= 1 + cooldown clear)
-        │   5. Portfolio guards            (cash check, warnings prep)
+        │   4. Candidate filter            (score >= 2 + cooldown clear)
         │
         ▼  ──────────────────────────────────────────────────────────────────
         │                      [news node]
-        │   6. Headline fetch              (up to 5 headlines via yfinance)
+        │   5. Headline fetch              (up to 5 headlines via yfinance)
         │      LLM sentiment per candidate (positive / neutral / negative)
         │      + one-line catalyst
         │
         ▼  ──────────────────────────────────────────────────────────────────
         │                      [decision node]
-        │   7. LLM BUY/IGNORE per candidate
+        │   6. LLM BUY/IGNORE per candidate
         │      (quantitative score + analyst consensus + vol pressure + news)
-        │   8. Portfolio-context warnings  (6 warning/hint scenarios)
-        │   9. Sort by confidence → effective score
+        │   7. Sort by confidence → effective score
         │
         ▼  ──────────────────────────────────────────────────────────────────
    buy_opportunities  [{ticker, action ("BUY SIGNAL"), confidence, sector,
-                        opportunity_score, news_sentiment, news_catalyst,
-                        current_position_pct, sector_allocation_pct,
-                        suggested_position_size,
-                        portfolio_warnings[], portfolio_hints[], ...}]
+                        opportunity_score, news_sentiment, news_catalyst, ...}]
 ```
 
 ---
@@ -266,46 +255,7 @@ Bypassed tickers are tagged `override_reason = "fresh_catalyst"` in the signal d
 
 ---
 
-### 5. Portfolio-Awareness Guards
-
-**File:** `nodes/alpha_scanner_agent.py`, `nodes/decision_node.py`
-
-#### Auto-fetching portfolio context
-
-When the agent starts, `_fetch_portfolio_context()` automatically runs the existing `PortfolioAgent` pipeline:
-
-```
-PortfolioAgent → loads positions
-MarketAgent    → fetches live prices for each holding
-RiskAgent      → computes sector_allocation and stock_allocation %
-```
-
-This ensures allocation percentages are based on **current market prices**, not historical cost basis.
-
-#### Cash check (opt-in hard stop)
-
-By default (`ignore_cash_check=True`), the agent runs regardless of `cash_available` — useful for signal research and paper trading. Pass `ignore_cash_check=False` or use `--enforce-cash` on the CLI to enable the hard stop:
-
-```bash
-python -m src.agents.opportunity.workflow --top-n 50 --once --enforce-cash
-```
-
-When enforced: if `portfolio_context["cash_available"] <= 0`, all LLM calls are skipped, candidates are recorded in `state.blocked_no_cash`, and an empty result is returned.
-
-#### Warnings, not filters
-
-All other cap checks surface as **warnings in the output** rather than silently removing tickers:
-
-| Condition                                     | Severity | Warning label           |
-| --------------------------------------------- | -------- | ----------------------- |
-| `position > _MAX_POSITION_WEIGHT` (10%)       | ⚠️       | `POSITION CAP EXCEEDED` |
-| `position > _MAX_POSITION_WEIGHT × 0.8` (8%)  | ⚠️       | `CONCENTRATION RISK`    |
-| `sector_alloc > _MAX_SECTOR_EXPOSURE` (60%)`  | ⚠️       | `SECTOR CAP EXCEEDED`   |
-| `sector_alloc > _SECTOR_TARGET_WEIGHT` (20%)` | ⚠️       | `SECTOR OVERWEIGHT`     |
-
----
-
-### 6. NewsNode — Sentiment Analysis
+### 5. NewsNode — Sentiment Analysis
 
 **File:** `nodes/news_node.py`
 
@@ -333,7 +283,7 @@ A dedicated LangGraph node that runs **after** candidates are filtered and **bef
 
 ---
 
-### 7. OpportunityDecisionAgent (LLM)
+### 6. OpportunityDecisionAgent (LLM)
 
 **File:** `engines/decision_agent.py`, `nodes/decision_node.py`
 
@@ -378,29 +328,16 @@ All candidates are dispatched concurrently using `ThreadPoolExecutor`, capped by
 
 ---
 
-### 8. Sort, Cap, and Emit
+### 7. Sort, Cap, and Emit
 
 **File:** `nodes/decision_node.py`
 
 BUY decisions are sorted by two keys:
 
 1. **Confidence rank** — `high` (0) → `moderate` (1) → `low` (2)
-2. **Effective opportunity score descending** — `opportunity_score + fit_boost` within the same confidence band
+2. **Opportunity score descending** within the same confidence band
 
 After sorting, the list is **capped at `_MAX_CONCURRENT_BUYS` (default: 3)** — only the highest-conviction setups are emitted per cycle.
-
-**Position sizing:** Each BUY entry receives a `suggested_position_size = cash_available / _MAX_CONCURRENT_BUYS` when cash is finite and positive.
-
-#### Portfolio-fit ranking boost
-
-Tickers in sectors currently **underweight** relative to `_SECTOR_TARGET_WEIGHT` (default 20%) receive a ranking bonus. This surfaces diversification opportunities without altering the raw score:
-
-```python
-fit_boost = max(0.0, _SECTOR_TARGET_WEIGHT - current_sector_pct) * _SECTOR_UNDERWEIGHT_BOOST
-# Example: sector at 10% → gap = 10% → boost = 10 × 0.5 = +5 effective points
-```
-
-The raw `score` in the output always reflects quantitative signals only.
 
 ---
 
@@ -410,43 +347,30 @@ The raw `score` in the output always reflects quantitative signals only.
 
 All pipeline stages read from and write to a single shared state object.
 
-| Field                   | Type              | Written by    | Description                                                        |
-| ----------------------- | ----------------- | ------------- | ------------------------------------------------------------------ |
-| `watchlist`             | `List[str]`       | caller        | Input tickers for this scan cycle                                  |
-| `portfolio_context`     | `Dict[str, Any]`  | caller / auto | Guardrail data (see schema below)                                  |
-| `ignore_cash_check`     | `bool`            | caller        | `True` (default) — skip zero-cash hard stop                        |
-| `market_data`           | `Dict[str, Dict]` | `scanner`     | Extended market data per ticker                                    |
-| `prefiltered`           | `List[str]`       | `scanner`     | Tickers that passed PreFilterEngine                                |
-| `signals`               | `Dict[str, Dict]` | `scanner`     | SignalEngine output per ticker (includes `opportunity_score`)      |
-| `candidates`            | `List[str]`       | `scanner`     | Score ≥ 2 + cooldown clear (or freshness bypass)                   |
-| `skipped_cooldown`      | `List[str]`       | `scanner`     | Tickers blocked by active cooldown this cycle                      |
-| `blocked_no_cash`       | `List[str]`       | `scanner`     | Tickers blocked by zero cash (only when `ignore_cash_check=False`) |
-| `recent_signal_context` | `Dict[str, Any]`  | `decision`    | `{ticker: {price, score}}` at last BUY — used for freshness bypass |
-| `news_sentiment`        | `Dict[str, Dict]` | `news`        | `{ticker: {sentiment, catalyst, headline_count}}`                  |
-| `decisions`             | `Dict[str, Dict]` | `decision`    | LLM output per candidate                                           |
-| `buy_opportunities`     | `List[Dict]`      | `decision`    | Final sorted BUY list (capped at `_MAX_CONCURRENT_BUYS`)           |
-| `scan_errors`           | `Dict[str, str]`  | `scanner`     | Fetch failures: ticker → error message                             |
-| `recent_signals`        | `Dict[str, str]`  | `decision`    | Cooldown tracker: ticker → last BUY ISO UTC timestamp              |
+| Field                   | Type              | Written by | Description                                                        |
+| ----------------------- | ----------------- | ---------- | ------------------------------------------------------------------ |
+| `watchlist`             | `List[str]`       | caller     | Input tickers for this scan cycle                                  |
+| `market_data`           | `Dict[str, Dict]` | `scanner`  | Extended market data per ticker                                    |
+| `prefiltered`           | `List[str]`       | `scanner`  | Tickers that passed PreFilterEngine                                |
+| `signals`               | `Dict[str, Dict]` | `scanner`  | SignalEngine output per ticker (includes `opportunity_score`)      |
+| `candidates`            | `List[str]`       | `scanner`  | Score ≥ 2 + cooldown clear (or freshness bypass)                   |
+| `skipped_cooldown`      | `List[str]`       | `scanner`  | Tickers blocked by active cooldown this cycle                      |
+| `recent_signal_context` | `Dict[str, Any]`  | `decision` | `{ticker: {price, score}}` at last BUY — used for freshness bypass |
+| `news_sentiment`        | `Dict[str, Dict]` | `news`     | `{ticker: {sentiment, catalyst, headline_count}}`                  |
+| `decisions`             | `Dict[str, Dict]` | `decision` | LLM output per candidate                                           |
+| `buy_opportunities`     | `List[Dict]`      | `decision` | Final sorted BUY list (capped at `_MAX_CONCURRENT_BUYS`)           |
+| `scan_errors`           | `Dict[str, str]`  | `scanner`  | Fetch failures: ticker → error message                             |
+| `recent_signals`        | `Dict[str, str]`  | `decision` | Cooldown tracker: ticker → last BUY ISO UTC timestamp              |
 
-### `portfolio_context` schema
+### Notes on portfolio context
 
-```python
-{
-    "sector_allocation":  {"Technology": 45.2, "Healthcare": 12.0},  # sector → %
-    "position_weights":   {"AAPL": 8.5, "MSFT": 6.2},               # ticker → %
-    "cash_available":     15000.0,                                    # deployable capital
-    "total_positions":    12,
-    "top_holding_weight": 8.5,
-}
-```
-
-All fields are optional. Missing fields default to safe values (`cash_available` defaults to `inf` so the agent runs without portfolio context).
+The opportunity agent is portfolio-agnostic. It does not accept or use any portfolio data. Portfolio constraint checking (position caps, sector caps, cash limits) is the responsibility of the caller or a higher-level supervisor agent.
 
 ---
 
 ## Output Format
 
-The final `buy_opportunities` list is sorted by confidence then effective score descending. Each entry includes quantitative signals, news context, and portfolio warnings:
+The final `buy_opportunities` list is sorted by confidence then opportunity score descending. Each entry includes quantitative signals and news context:
 
 ```json
 [
@@ -465,40 +389,11 @@ The final `buy_opportunities` list is sorted by confidence then effective score 
       "Analyst consensus: buy (14 analysts, target $480, +22% upside)"
     ],
     "sector": "Technology",
-    "current_position_pct": 12.4,
-    "sector_allocation_pct": 68.3,
-    "suggested_position_size": 5000.0,
     "news_sentiment": "positive",
-    "news_catalyst": "Microsoft Azure revenue beat analyst estimates by 8%.",
-    "portfolio_warnings": [
-      "⚠️  POSITION CAP EXCEEDED: MSFT is already 12.4% of portfolio (cap: 10%).",
-      "⚠️  SECTOR CAP EXCEEDED: Technology is at 68.3% (hard cap: 60%)."
-    ],
-    "portfolio_hints": [
-      "ℹ️  TIGHT CAPITAL: 18% of portfolio capital available. Recommend max 5.0% position size."
-    ]
+    "news_catalyst": "Microsoft Azure revenue beat analyst estimates by 8%."
   }
 ]
 ```
-
-### Portfolio Context fields
-
-Each BUY entry carries `portfolio_warnings` and `portfolio_hints`. All 12 scenarios:
-
-| Scenario                     | Condition                                       | Output type | Label                         |
-| ---------------------------- | ----------------------------------------------- | ----------- | ----------------------------- |
-| Position cap exceeded        | `current_position > _MAX_POSITION_WEIGHT` (10%) | ⚠️ warning  | `POSITION CAP EXCEEDED`       |
-| Approaching position cap     | `current_position > 8%`                         | ⚠️ warning  | `CONCENTRATION RISK`          |
-| Existing position within cap | `current_position > 0` and ≤ 8%                 | ℹ️ hint     | current position info         |
-| New position                 | `current_position == 0`                         | ✓ hint      | `NEW POSITION`                |
-| Sector hard cap exceeded     | `sector_alloc > _MAX_SECTOR_EXPOSURE` (60%)     | ⚠️ warning  | `SECTOR CAP EXCEEDED`         |
-| Sector overweight            | `sector_alloc > _SECTOR_TARGET_WEIGHT` (20%)    | ⚠️ warning  | `SECTOR OVERWEIGHT`           |
-| Sector underweight           | gap > 5% below target                           | ✓ hint      | `DIVERSIFICATION OPPORTUNITY` |
-| Sector neutral               | within 5% of target                             | ℹ️ hint     | `SECTOR FIT`                  |
-| Limited capital              | `cash_pct < 10%`                                | ⚠️ warning  | `LIMITED CAPITAL`             |
-| Tight capital                | `cash_pct 10–25%`                               | ℹ️ hint     | `TIGHT CAPITAL`               |
-| Capital available            | `cash_pct > 25%`                                | ✓ hint      | `CAPITAL AVAILABLE`           |
-| Unlimited capital            | `cash_available == inf`                         | ✓ hint      | `UNLIMITED CAPITAL`           |
 
 ### CLI output format
 
@@ -519,7 +414,7 @@ ALPHA SIGNAL — OPPORTUNITY DETECTED
   Entry Quality : strong
   Score         : +3
   Type          : dip_buy
-  Sector        : Technology  (held: 0.0%  |  sector alloc: 45.0%)
+  Sector        : Technology
 
   News          : POSITIVE  —  Azure revenue beat estimates by 8%.
 
@@ -532,29 +427,17 @@ ALPHA SIGNAL — OPPORTUNITY DETECTED
   Score +3 (strong_buy tier): multiple confirming signals with analyst upside.
 
 ------------------------------------------------------------
-PORTFOLIO CONSTRAINTS (Advisory)
-------------------------------------------------------------
-
-  ✓ NEW POSITION: MSFT not currently held; clean entry opportunity.
-  ✓ CAPITAL AVAILABLE: 42% deployable. Full sizing up to 10% is possible.
-
-------------------------------------------------------------
 EXECUTION STATUS
 ------------------------------------------------------------
 
   Actionable    : YES
 
-  Suggested size: $5,000  (cash ÷ 3 max buys)
-
   Suggested Actions:
       - Execute BUY for MSFT
-      - Limit position to $5,000
       - Set stop-loss below 52-week low
 
 ============================================================
 ```
-
-**Actionable** is automatically `YES` when no hard-cap portfolio warnings fired, `NO` otherwise — with situation-specific remediation steps.
 
 ---
 
@@ -564,15 +447,15 @@ EXECUTION STATUS
 
 Seven telemetry events are emitted per scan cycle:
 
-| Event                 | When emitted                      | Key payload fields                                                                                                                                   |
-| --------------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `scan_start`          | Before any fetch                  | `watchlist_size`, `timestamp`                                                                                                                        |
-| `prefilter_complete`  | After PreFilterEngine             | `total`, `passed`, `filtered_out`, `latency_ms`                                                                                                      |
-| `signals_generated`   | After SignalEngine                | `scored`, `strong_buy_tier`, `buy_tier`, `neutral_tier`, `avoid_tier`, `latency_ms`                                                                  |
-| `candidates_filtered` | After candidate + cooldown filter | `candidate_count`, `filtered_count`, `skipped_cooldown`                                                                                              |
-| `llm_decision`        | Per ticker, after LLM call        | `ticker`, `score`, `action`, `confidence`, `latency_ms`                                                                                              |
-| `buy_signal_emitted`  | Per BUY result                    | `ticker`, `score`, `confidence`, `entry_quality`, `type`, `sector`, `current_position_pct`, `sector_allocation_pct`, `warnings_count`, `hints_count` |
-| `scan_summary`        | End of every scan cycle           | `watchlist_size`, `fetched`, `prefiltered`, `scored`, `candidates`, `approved`, `buy_opportunities`, `step_latencies_ms`, `buy_tickers`              |
+| Event                 | When emitted                      | Key payload fields                                                                                                                      |
+| --------------------- | --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `scan_start`          | Before any fetch                  | `watchlist_size`, `timestamp`                                                                                                           |
+| `prefilter_complete`  | After PreFilterEngine             | `total`, `passed`, `filtered_out`, `latency_ms`                                                                                         |
+| `signals_generated`   | After SignalEngine                | `scored`, `strong_buy_tier`, `buy_tier`, `neutral_tier`, `avoid_tier`, `latency_ms`                                                     |
+| `candidates_filtered` | After candidate + cooldown filter | `candidate_count`, `filtered_count`, `skipped_cooldown`                                                                                 |
+| `llm_decision`        | Per ticker, after LLM call        | `ticker`, `score`, `action`, `confidence`, `latency_ms`                                                                                 |
+| `buy_signal_emitted`  | Per BUY result                    | `ticker`, `score`, `confidence`, `entry_quality`, `type`, `sector`                                                                      |
+| `scan_summary`        | End of every scan cycle           | `watchlist_size`, `fetched`, `prefiltered`, `scored`, `candidates`, `approved`, `buy_opportunities`, `step_latencies_ms`, `buy_tickers` |
 
 #### Per-step latency tracking
 
@@ -619,9 +502,6 @@ python -m src.agents.opportunity.workflow --tickers AAPL MSFT NVDA GOOGL META --
 
 # Dynamic universe — top 50 S&P 500 constituents (US, default)
 python -m src.agents.opportunity.workflow --top-n 50 --once
-
-# Enforce cash guard (hard-stop when portfolio has no deployable capital)
-python -m src.agents.opportunity.workflow --top-n 50 --once --enforce-cash
 
 # Verbose — per-ticker pipeline digest table after the scan
 python -m src.agents.opportunity.workflow --top-n 50 --once --verbose
@@ -677,18 +557,11 @@ from src.agents.opportunity.workflow import trigger_scan
 
 opportunities = trigger_scan(
     tickers=["AAPL", "MSFT", "NVDA", "META", "GOOGL"],
-    portfolio_context={
-        "sector_allocation": {"Technology": 48.0, "Healthcare": 12.0},
-        "position_weights":  {"AAPL": 9.0, "MSFT": 12.4},
-        "cash_available":    20000.0,
-    },
 )
 
 for opp in opportunities:
     print(f"{opp['ticker']} — {opp['confidence']} | news: {opp.get('news_sentiment')}")
     print(f"  catalyst: {opp.get('news_catalyst')}")
-    for w in opp.get("portfolio_warnings", []):
-        print(f"  {w}")
 ```
 
 #### Dynamic universe helper
@@ -736,16 +609,6 @@ if is_market_open("US"):
 | `OPENAI_API_KEY`          | Conditional | Required when using the OpenAI provider.                                       |
 | `GOOGLE_API_KEY`          | Conditional | Required when using the Google provider.                                       |
 
-**Model resolution order:**
-
-```
-ALPHA_SCANNER_LLM_MODEL  →  infer_provider(model)
-        ↓ (not set)
-PORTFOLIO_LLM_MODEL  →  infer_provider(model)
-        ↓ (not set)
-PORTFOLIO_LLM_PROVIDER  +  provider default model
-```
-
 ---
 
 ### Supported Markets
@@ -777,28 +640,23 @@ Custom or fine-tuned models are accepted — an unknown name emits a warning but
 
 **`nodes/alpha_scanner_agent.py`**
 
-| Constant                   | Default     | Description                                                              |
-| -------------------------- | ----------- | ------------------------------------------------------------------------ |
-| `_COOLDOWN_MINUTES`        | `30`        | Cooldown window length (unit determined by `_COOLDOWN_UNIT`)             |
-| `_COOLDOWN_UNIT`           | `"minutes"` | Cooldown unit: `"minutes"` \| `"hours"` \| `"days"`                      |
-| `_CANDIDATE_MIN_SCORE`     | `2`         | Minimum signal score required to advance to news + LLM decision          |
-| `_MAX_SECTOR_EXPOSURE`     | `60.0`      | Sector allocation % above which `SECTOR CAP EXCEEDED` warning is emitted |
-| `_MAX_POSITION_WEIGHT`     | `10.0`      | Position weight % above which `POSITION CAP EXCEEDED` warning is emitted |
-| `_MAX_FETCH_WORKERS`       | `10`        | Maximum parallel yfinance fetch threads                                  |
-| `_MAX_CONCURRENT_BUYS`     | `3`         | Max BUY signals emitted per scan cycle; also used for position sizing    |
-| `_MAX_SIGNAL_SCORE`        | `5.0`       | Theoretical max raw signal score (opportunity score normalization)       |
-| `_EVENT_OVERRIDE_MIN_MOVE` | `8.0`       | Abs price move % that triggers event override (bypass score gate)        |
-| `_EVENT_OVERRIDE_52W_BAND` | `0.30`      | Price must be in lower 30% of 52w range for event override to apply      |
+| Constant                   | Default     | Description                                                         |
+| -------------------------- | ----------- | ------------------------------------------------------------------- |
+| `_COOLDOWN_MINUTES`        | `30`        | Cooldown window length (unit determined by `_COOLDOWN_UNIT`)        |
+| `_COOLDOWN_UNIT`           | `"minutes"` | Cooldown unit: `"minutes"` \| `"hours"` \| `"days"`                 |
+| `_CANDIDATE_MIN_SCORE`     | `2`         | Minimum signal score required to advance to news + LLM decision     |
+| `_MAX_FETCH_WORKERS`       | `10`        | Maximum parallel yfinance fetch threads                             |
+| `_MAX_CONCURRENT_BUYS`     | `3`         | Max BUY signals emitted per scan cycle                              |
+| `_MAX_SIGNAL_SCORE`        | `5.0`       | Theoretical max raw signal score (opportunity score normalization)  |
+| `_EVENT_OVERRIDE_MIN_MOVE` | `8.0`       | Abs price move % that triggers event override (bypass score gate)   |
+| `_EVENT_OVERRIDE_52W_BAND` | `0.30`      | Price must be in lower 30% of 52w range for event override to apply |
 
 **`nodes/decision_node.py`**
 
-| Constant                      | Default | Description                                                                |
-| ----------------------------- | ------- | -------------------------------------------------------------------------- |
-| `_MAX_LLM_WORKERS`            | `5`     | Maximum concurrent LLM decision threads per scan cycle                     |
-| `_DECISION_CACHE_TTL_MINUTES` | `15`    | LLM response cache lifetime (key: `ticker:score:type`)                     |
-| `_SECTOR_UNDERWEIGHT_BOOST`   | `0.5`   | Ranking bonus per % a sector is below `_SECTOR_TARGET_WEIGHT`              |
-| `_SECTOR_TARGET_WEIGHT`       | `20.0`  | Target sector allocation % used for diversification hints and rank boosts  |
-| `_MAX_CONCURRENT_BUYS`        | `3`     | Imported from `alpha_scanner_agent`; used for output cap + position sizing |
+| Constant                      | Default | Description                                            |
+| ----------------------------- | ------- | ------------------------------------------------------ |
+| `_MAX_LLM_WORKERS`            | `5`     | Maximum concurrent LLM decision threads per scan cycle |
+| `_DECISION_CACHE_TTL_MINUTES` | `15`    | LLM response cache lifetime (key: `ticker:score:type`) |
 
 **`nodes/news_node.py`**
 
@@ -862,10 +720,7 @@ while market_open():
 ```python
 @app.post("/hooks/price-spike")
 async def on_price_spike(event: PriceSpikeEvent):
-    opportunities = trigger_scan(
-        tickers=[event.ticker],
-        portfolio_context=get_live_portfolio_context(),
-    )
+    opportunities = trigger_scan(tickers=[event.ticker])
     if opportunities:
         notify_trader(opportunities)
 ```
@@ -876,28 +731,27 @@ Other trigger patterns: volatility alerts, earnings calendar, index rebalance ev
 
 ## Design Decisions
 
-| Decision                                                 | Rationale                                                                                                                                                                                                                                                                                                                                                                                                       |
-| -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **3-node LangGraph graph (scanner → news → decision)**   | Each node has one responsibility. NewsNode can be disabled or swapped independently. DecisionNode isolation makes it easy to replace the LLM without touching fetch or signal logic.                                                                                                                                                                                                                            |
-| **NewsNode only for candidates**                         | Fetching headlines + running LLM for every ticker in a 200-stock universe adds ~200 LLM calls per scan. Running news only on candidates (score ≥ 1) keeps cost proportional to signal quality.                                                                                                                                                                                                                  |
-| **Analyst signals in SignalEngine, not LLM prompt only** | Analyst consensus is a quantitative fact (rating + count + target). Encoding it as a scored signal (+1/−1) means it affects the tier and candidate filter deterministically, not just LLM verdict probability.                                                                                                                                                                                                  |
-| **Vol pressure proxy from free data**                    | Level-2 order flow requires a paid data feed. Price direction × volume spike is a free, reproducible proxy for institutional buy/sell pressure available in every yfinance info call.                                                                                                                                                                                                                           |
-| **`engines/`, `nodes/`, `markets/` subfolders**          | Groups files by responsibility: engines are pure computation (no I/O, no graph nodes); nodes are LangGraph-runnable pipeline stages; markets isolate exchange-specific schedules and universes.                                                                                                                                                                                                                 |
-| **PreFilterEngine before SignalEngine**                  | At 500+ tickers, running 8 signals and LLM on every ticker is expensive. The prefilter drops uninteresting tickers with zero scoring cost.                                                                                                                                                                                                                                                                      |
-| **Volatility weight = −2**                               | A weight of −1 let `pe_improvement (+1) + 52w_lower_band (+1) + volatility (−1) = +1` pass. At −2 the net is 0 (neutral) and the ticker does not advance.                                                                                                                                                                                                                                                       |
-| **Type from SignalEngine, not LLM**                      | `dip_buy / value / momentum` is inferred from which fundamental signals fired. Deterministic inference is reproducible across providers and immune to prompt drift.                                                                                                                                                                                                                                             |
-| **Warnings, not filters for cap breaches**               | Silently removing a ticker creates invisible blind spots. A `⚠️ POSITION CAP EXCEEDED` warning in the output is more actionable than hiding the recommendation entirely.                                                                                                                                                                                                                                        |
-| **Auto-fetch via PortfolioAgent pipeline**               | Running `PortfolioAgent → MarketAgent → RiskAgent` ensures allocation % use current market prices. Without `MarketAgent`, a 15-share MSFT position at avg_cost $403 appears ~40% of a $15k portfolio.                                                                                                                                                                                                           |
-| **LLM parallelisation + short-TTL cache**                | 5 concurrent decision threads reduce wall-clock time from N×3.5s to ~3.5s. The 15-min cache prevents redundant API calls for the same ticker in the same signal state across repeated intraday scans.                                                                                                                                                                                                           |
-| **Portfolio-fit boost on rank, not raw score**           | Underweight sectors surface higher in the sorted list without corrupting the raw signal score. The `score` field in output always reflects quantitative signals only.                                                                                                                                                                                                                                           |
-| **`zoneinfo` over `pytz`**                               | `zoneinfo` is Python 3.9+ stdlib — zero extra dependency, identical capability for NYSE/NSE hours checking.                                                                                                                                                                                                                                                                                                     |
-| **`OllamaProvider.max_concurrency = 1`**                 | Ollama returns HTTP 429 when multiple requests arrive simultaneously. All three LLM call sites — `DecisionNode`, `NewsNode`, `OpportunityDecisionAgent` — cap workers via `min(candidates, provider.max_concurrency, _MAX_LLM_WORKERS)`. A secondary 3-attempt exponential-backoff retry (2 s → 4 s) in `OpportunityDecisionAgent` and `_summarise_news` handles any 429 that slips through on cloud providers. |
+| Decision                                                 | Rationale                                                                                                                                                                                                                                                                                                                                             |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **3-node LangGraph graph (scanner → news → decision)**   | Each node has one responsibility. NewsNode can be disabled or swapped independently. DecisionNode isolation makes it easy to replace the LLM without touching fetch or signal logic.                                                                                                                                                                  |
+| **NewsNode only for candidates**                         | Fetching headlines + running LLM for every ticker in a 200-stock universe adds ~200 LLM calls per scan. Running news only on candidates (score ≥ 1) keeps cost proportional to signal quality.                                                                                                                                                        |
+| **Analyst signals in SignalEngine, not LLM prompt only** | Analyst consensus is a quantitative fact (rating + count + target). Encoding it as a scored signal (+1/−1) means it affects the tier and candidate filter deterministically, not just LLM verdict probability.                                                                                                                                        |
+| **Vol pressure proxy from free data**                    | Level-2 order flow requires a paid data feed. Price direction × volume spike is a free, reproducible proxy for institutional buy/sell pressure available in every yfinance info call.                                                                                                                                                                 |
+| **`engines/`, `nodes/`, `markets/` subfolders**          | Groups files by responsibility: engines are pure computation (no I/O, no graph nodes); nodes are LangGraph-runnable pipeline stages; markets isolate exchange-specific schedules and universes.                                                                                                                                                       |
+| **PreFilterEngine before SignalEngine**                  | At 500+ tickers, running 8 signals and LLM on every ticker is expensive. The prefilter drops uninteresting tickers with zero scoring cost.                                                                                                                                                                                                            |
+| **Volatility weight = −2**                               | A weight of −1 let `pe_improvement (+1) + 52w_lower_band (+1) + volatility (−1) = +1` pass. At −2 the net is 0 (neutral) and the ticker does not advance.                                                                                                                                                                                             |
+| **Type from SignalEngine, not LLM**                      | `dip_buy / value / momentum` is inferred from which fundamental signals fired. Deterministic inference is reproducible across providers and immune to prompt drift.                                                                                                                                                                                   |
+| **Warnings, not filters for cap breaches**               | Removed — the opportunity agent has no portfolio context. All signals are emitted unconditionally; portfolio constraint checking is the caller's responsibility.                                                                                                                                                                                      |
+| **Auto-fetch via PortfolioAgent pipeline**               | Removed — the opportunity agent is now fully portfolio-agnostic. It does not import or call any portfolio subagents.                                                                                                                                                                                                                                  |
+| **LLM parallelisation + short-TTL cache**                | 5 concurrent decision threads reduce wall-clock time from N×3.5s to ~3.5s. The 15-min cache prevents redundant API calls for the same ticker in the same signal state across repeated intraday scans.                                                                                                                                                 |
+| **`zoneinfo` over `pytz`**                               | `zoneinfo` is Python 3.9+ stdlib — zero extra dependency, identical capability for NYSE/NSE hours checking.                                                                                                                                                                                                                                           |
+| **`OllamaProvider.max_concurrency = 1`**                 | Ollama returns HTTP 429 when multiple requests arrive simultaneously. All LLM call sites — `DecisionNode`, `NewsNode`, `OpportunityDecisionAgent` — cap workers via `min(candidates, provider.max_concurrency, _MAX_LLM_WORKERS)`. A secondary 3-attempt exponential-backoff retry (2 s → 4 s) handles any 429 that slips through on cloud providers. |
 
 ---
 
 ## Integration with PortfolioAgent
 
-The two agents are complementary and non-overlapping:
+`AlphaScannerAgent` and `PortfolioAgent` are complementary, fully independent agents:
 
 | Concern                                         | Agent                                    |
 | ----------------------------------------------- | ---------------------------------------- |
@@ -905,49 +759,4 @@ The two agents are complementary and non-overlapping:
 | Manage existing holdings (HOLD / REDUCE / EXIT) | **PortfolioAgent**                       |
 | Risk calculation for existing portfolio         | **RiskAgent** (via PortfolioAgent graph) |
 
-#### Automatic integration (default)
-
-When `portfolio_context` is not supplied, the workflow calls `_fetch_portfolio_context()` automatically:
-
-```
-PortfolioAgent  →  loads positions from mock_data / brokerage API
-MarketAgent     →  fetches live prices for each holding
-RiskAgent       →  computes sector_allocation and stock_allocation %
-                   using current market values, not avg_cost
-```
-
-#### Manual override
-
-Supply `portfolio_context` directly to bypass the auto-fetch (faster for tests):
-
-```python
-from src.agents.opportunity.workflow import trigger_scan
-
-opportunities = trigger_scan(
-    tickers=["META", "NVDA", "AMZN", "GOOGL"],
-    portfolio_context={
-        "sector_allocation": {"Technology": 68.3, "Financials": 15.0},
-        "position_weights":  {"MSFT": 12.4, "NVDA": 9.1},
-        "cash_available":    18000.0,
-    },
-)
-```
-
-#### Feeding from a completed PortfolioAgent run
-
-```python
-from src.agents.portfolio.workflow import build_graph as build_portfolio_graph
-from src.agents.portfolio.state import PortfolioState
-from src.agents.opportunity.workflow import trigger_scan
-
-portfolio_result = build_portfolio_graph().invoke(PortfolioState())
-
-opportunities = trigger_scan(
-    tickers=["META", "NVDA", "AMZN", "GOOGL"],
-    portfolio_context={
-        "sector_allocation": portfolio_result.sector_allocation,
-        "position_weights":  portfolio_result.risk_metrics.get("stock_allocation", {}),
-        "cash_available":    portfolio_result.risk_metrics.get("cash_balance", 0.0),
-    },
-)
-```
+They share no code, no imports, and no runtime coupling. You can run either agent standalone. If you want to combine insights from both (e.g., skip BUY signals for positions already above a size cap), that orchestration belongs in a higher-level supervisor agent — not inside either individual agent.
