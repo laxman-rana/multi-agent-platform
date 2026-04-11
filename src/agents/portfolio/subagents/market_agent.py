@@ -1,5 +1,7 @@
 import logging
 
+from src.agents.base import BaseAgent
+from src.agents.portfolio.models import StockInsight
 from src.agents.portfolio.state import PortfolioState
 from src.agents.portfolio.tools.market_tools import get_stock_data
 from src.observability import get_telemetry_logger
@@ -10,7 +12,7 @@ logger = logging.getLogger(__name__)
 VOLATILITY_THRESHOLD = 0.30
 
 
-class MarketAgent:
+class MarketAgent(BaseAgent):
     """
     Fetches current market data for every position in the portfolio.
     Populates state.stock_insights with enriched per-ticker data.
@@ -23,7 +25,7 @@ class MarketAgent:
         telemetry = get_telemetry_logger()
 
         for pos in state.portfolio:
-            ticker = pos["ticker"]
+            ticker = pos.ticker
             data = get_stock_data(ticker)
             telemetry.log_tool_usage(
                 "get_stock_data",
@@ -32,17 +34,17 @@ class MarketAgent:
             )
 
             # Enrich market data with portfolio cost-basis context
-            data["avg_cost"] = pos["avg_cost"]
-            data["shares"] = pos["shares"]
-            data["sector"] = pos["sector"]
+            data["avg_cost"] = pos.avg_cost
+            data["shares"] = pos.shares
+            data["sector"] = pos.sector
             data["unrealized_pnl"] = round(
-                (data["price"] - pos["avg_cost"]) * pos["shares"], 2
+                (data["price"] - pos.avg_cost) * pos.shares, 2
             )
-            insights[ticker] = data
+            insights[ticker] = StockInsight.model_validate(data)
 
         state.stock_insights = insights
 
-        high_vol = [t for t, d in insights.items() if d["volatility"] > VOLATILITY_THRESHOLD]
+        high_vol = [t for t, d in insights.items() if d.volatility > VOLATILITY_THRESHOLD]
         logger.info(
             "[MarketAgent] Fetched data for %d tickers | High-volatility (>%s): %s",
             len(insights),

@@ -1,10 +1,12 @@
-from typing import Any, Dict, List
+from typing import Dict, List
+
+from src.agents.portfolio.models import Position, RiskMetrics, StockInsight
 
 
 def calculate_risk(
-    positions: List[Dict[str, Any]],
-    stock_insights: Dict[str, Dict[str, Any]],
-) -> Dict[str, Any]:
+    positions: List[Position],
+    stock_insights: Dict[str, StockInsight],
+) -> RiskMetrics:
     """
     Calculate portfolio-level risk metrics from positions and market data.
 
@@ -20,14 +22,15 @@ def calculate_risk(
     unrealized_pnl = 0.0
 
     for pos in positions:
-        ticker = pos["ticker"]
-        shares = pos["shares"]
-        avg_cost = pos["avg_cost"]
-        sector = pos["sector"]
+        ticker = pos.ticker
+        shares = pos.shares
+        avg_cost = pos.avg_cost
+        sector = pos.sector
 
         # Use current price from insights if available; fallback to avg_cost
-        current_price = stock_insights.get(ticker, {}).get("price", avg_cost)
-        volatility = stock_insights.get(ticker, {}).get("volatility", 0.20)
+        insight = stock_insights.get(ticker)
+        current_price = insight.price if insight else avg_cost
+        volatility = insight.volatility if insight else 0.20
 
         market_value = shares * current_price
         cost_basis = shares * avg_cost
@@ -39,7 +42,7 @@ def calculate_risk(
         weighted_volatility += market_value * volatility
 
     if total_value == 0:
-        return {}
+        return RiskMetrics()
 
     # Normalize weighted volatility by total portfolio value
     weighted_volatility /= total_value
@@ -72,18 +75,18 @@ def calculate_risk(
     else:
         concentration_risk = "low"
 
-    return {
-        "total_portfolio_value": round(total_value, 2),
-        "unrealized_pnl": round(unrealized_pnl, 2),
-        "unrealized_pnl_pct": round(
+    return RiskMetrics(
+        total_portfolio_value=round(total_value, 2),
+        unrealized_pnl=round(unrealized_pnl, 2),
+        unrealized_pnl_pct=round(
             (unrealized_pnl / (total_value - unrealized_pnl)) * 100, 2
         ),
-        "weighted_volatility": round(weighted_volatility, 4),
-        "sector_allocation": sector_allocation,
-        "stock_allocation": stock_allocation,
-        "top_sector": top_sector,
-        "top_stock": top_stock,
-        "high_concentration_stocks": high_concentration_stocks,
-        "high_concentration": len(high_concentration_stocks) > 0,
-        "concentration_risk": concentration_risk,
-    }
+        weighted_volatility=round(weighted_volatility, 4),
+        sector_allocation=sector_allocation,
+        stock_allocation=stock_allocation,
+        top_sector=top_sector,
+        top_stock=top_stock,
+        high_concentration_stocks=high_concentration_stocks,
+        high_concentration=len(high_concentration_stocks) > 0,
+        concentration_risk=concentration_risk,
+    )

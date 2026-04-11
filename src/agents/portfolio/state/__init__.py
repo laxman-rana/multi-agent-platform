@@ -1,5 +1,16 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Dict, List, Optional
+
+from src.agents.portfolio.models import (
+    CriticFeedback,
+    PortfolioAction,
+    Position,
+    RiskMetrics,
+    StockDecision,
+    StockInsight,
+    NewsArticle,
+    UserProfile,
+)
 
 
 @dataclass
@@ -10,32 +21,31 @@ class PortfolioState:
     """
 
     # Who the investor is and their risk preferences
-    user_profile: Dict[str, Any] = field(default_factory=dict)
+    user_profile: UserProfile = field(default_factory=UserProfile)
 
-    # Raw positions: list of {ticker, shares, avg_cost, sector}
-    portfolio: List[Dict[str, Any]] = field(default_factory=list)
+    # Raw positions
+    portfolio: List[Position] = field(default_factory=list)
 
     # Sector allocation percentages derived from portfolio values
     sector_allocation: Dict[str, float] = field(default_factory=dict)
 
     # Portfolio-level risk metrics (concentration, volatility, PnL, etc.)
-    risk_metrics: Dict[str, Any] = field(default_factory=dict)
+    risk_metrics: RiskMetrics = field(default_factory=RiskMetrics)
 
     # Per-ticker market data enriched with cost basis context
-    stock_insights: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    stock_insights: Dict[str, StockInsight] = field(default_factory=dict)
 
     # Per-ticker news articles when high-volatility routing is triggered
-    news: Dict[str, List[Dict[str, str]]] = field(default_factory=dict)
+    news: Dict[str, List[NewsArticle]] = field(default_factory=dict)
 
-    # LLM-generated decisions: ticker → {action, reason, confidence, gain_pct}
-    decisions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # LLM-generated decisions: ticker → StockDecision
+    decisions: Dict[str, StockDecision] = field(default_factory=dict)
 
-    # Critic validation result: approved flag + per-ticker issues + warnings
-    critic_feedback: Dict[str, Any] = field(default_factory=dict)
+    # Critic validation result
+    critic_feedback: CriticFeedback = field(default_factory=CriticFeedback)
 
     # Portfolio-level rebalance recommendation computed by DecisionAgent
-    # after all per-ticker decisions are made.
-    portfolio_action: Dict[str, Any] = field(default_factory=dict)
+    portfolio_action: Optional[PortfolioAction] = None
 
     # Number of times DecisionAgent has been re-run due to critic rejection.
     # Managed by the graph layer (workflow.py) — agents must not write this field.

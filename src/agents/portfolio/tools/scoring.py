@@ -21,6 +21,8 @@ Usage::
 
 from typing import Any, Dict, List, Tuple
 
+from src.agents.portfolio.models import StockInsight
+
 
 # ---------------------------------------------------------------------------
 # Tier thresholds
@@ -174,7 +176,7 @@ def _sig_news(news_score: int) -> Tuple[int, str]:
 # ---------------------------------------------------------------------------
 
 def score_stock(
-    insight: Dict[str, Any],
+    insight: StockInsight,
     gain_pct: float,
     horizon_years: float = 1.0,
     news_score: int = 0,
@@ -204,23 +206,23 @@ def score_stock(
     long_term = horizon_years >= 3.0
 
     raw_signals: List[Tuple[int, str]] = [
-        _sig_pe_improvement(insight.get("pe_ratio"), insight.get("forward_pe")),
-        _sig_pe_valuation(insight.get("pe_ratio")),
-        _sig_volatility(insight.get("volatility", 0.0)),
+        _sig_pe_improvement(insight.pe_ratio, insight.forward_pe),
+        _sig_pe_valuation(insight.pe_ratio),
+        _sig_volatility(insight.volatility),
         _sig_unrealised_pnl(gain_pct),
         # Daily session change is noise for long-term investors — suppress at ≥ 3 years.
-        (0, "") if long_term else _sig_daily_change(insight.get("change_pct", 0.0)),
+        (0, "") if long_term else _sig_daily_change(insight.change_pct),
         _sig_52w_position(
-            insight.get("price", 0.0),
-            insight.get("52w_high", 0.0),
-            insight.get("52w_low", 0.0),
+            insight.price,
+            insight.week_52_high,
+            insight.week_52_low,
         ),
         _sig_mean_reversion(
-            insight.get("price", 0.0),
-            insight.get("52w_high", 0.0),
-            insight.get("52w_low", 0.0),
-            insight.get("pe_ratio"),
-            insight.get("forward_pe"),
+            insight.price,
+            insight.week_52_high,
+            insight.week_52_low,
+            insight.pe_ratio,
+            insight.forward_pe,
             gain_pct,
         ),
         _sig_news(news_score),

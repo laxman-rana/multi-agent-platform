@@ -12,7 +12,14 @@ that answers the question the per-ticker loop cannot:
 No LLM involved — all logic is rule-based and reproducible.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Dict, List
+
+from src.agents.portfolio.models import (
+    PortfolioAction,
+    Position,
+    RiskMetrics,
+    StockDecision,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -35,10 +42,10 @@ _MIN_SECTORS = 3
 
 def compute_portfolio_action(
     sector_allocation: Dict[str, float],
-    decisions: Dict[str, Dict[str, Any]],
-    risk_metrics: Dict[str, Any],
-    portfolio: List[Dict[str, Any]],
-) -> Dict[str, Any]:
+    decisions: Dict[str, StockDecision],
+    risk_metrics: RiskMetrics,
+    portfolio: List[Position],
+) -> PortfolioAction:
     """
     Derive a portfolio-level action from current state.
 
@@ -61,16 +68,14 @@ def compute_portfolio_action(
         missing_sectors    list[str]   — broad sectors that are absent
         summary            str         — one human-readable sentence
     """
-    action: Dict[str, Any] = {
-        "rebalance":           False,
-        "reduce_sector":       None,
-        "current_exposure":    None,
-        "target_exposure":     None,
-        "priority_exits":      [],
-        "add_diversification": False,
-        "missing_sectors":     [],
-        "summary":             "Portfolio allocation is within acceptable bounds.",
-    }
+    rebalance = False
+    reduce_sector: str = ""
+    current_exposure: float = 0.0
+    target_exposure: float = 0.0
+    priority_exits: List[str] = []
+    add_diversification = False
+    missing_sectors: List[str] = []
+    summary = "Portfolio allocation is within acceptable bounds."
 
     # ── 1. Sector concentration check ────────────────────────────────────
     if sector_allocation:
@@ -78,29 +83,29 @@ def compute_portfolio_action(
         top_pct    = sector_allocation[top_sector]
 
         if top_pct > _SECTOR_TARGET_MAX_PCT:
-            action["rebalance"]        = True
-            action["reduce_sector"]    = top_sector
-            action["current_exposure"] = round(top_pct, 1)
-            action["target_exposure"]  = f"{int(_SECTOR_TARGET_MAX_PCT)}%"
+            rebalance = True
+            reduce_sector = top_sector
+            current_exposure = round(top_pct, 1)
+            target_exposure = float(_SECTOR_TARGET_MAX_PCT)
 
             # Tickers in the overweight sector that DecisionAgent already flagged EXIT
             sector_map: Dict[str, str] = {
-                pos["ticker"]: pos["sector"] for pos in portfolio
+                pos.ticker: pos.sector for pos in portfolio
             }
-            action["priority_exits"] = [
+            priority_exits = [
                 ticker
                 for ticker, d in decisions.items()
-                if d.get("action") == "EXIT"
+                if d.action == "EXIT"
                 and sector_map.get(ticker) == top_sector
             ]
 
             severity = "critically" if top_pct >= _SECTOR_CRITICAL_PCT else "significantly"
-            action["summary"] = (
+            summary = (
                 f"{top_sector} is {severity} overweight at {top_pct:.1f}% "
                 f"(target ≤ {int(_SECTOR_TARGET_MAX_PCT)}%). "
                 + (
-                    f"Priority exits: {', '.join(action['priority_exits'])}."
-                    if action["priority_exits"]
+                    f"Priority exits: {', '.join(priority_exits)}."
+                    if priority_exits
                     else "Consider trimming positions to rebalance."
                 )
             )
@@ -113,12 +118,21 @@ def compute_portfolio_action(
     ]
     present = set(sector_allocation.keys())
     if len(present) < _MIN_SECTORS:
-        action["add_diversification"] = True
-        action["missing_sectors"] = [s for s in _BROAD_SECTORS if s not in present][:4]
+        add_diversification = True
+        missing_sectors = [s for s in _BROAD_SECTORS if s not in present][:4]
         diversify_note = (
             f"Only {len(present)} sector(s) present — consider adding: "
-            + ", ".join(action["missing_sectors"]) + "."
+            + ", ".join(missing_sectors) + "."
         )
-        action["summary"] = action["summary"].rstrip(".") + ". " + diversify_note
+        summary = summary.rstrip(".") + ". " + diversify_note
 
-    return action
+    return PortfolioAction(
+        rebalance=rebalance,
+        reduce_sector=reduce_sector,
+        current_exposure=current_exposure,
+        target_exposure=target_exposure,
+        priority_exits=priority_exits,
+        add_diversification=add_diversification,
+        missing_sectors=missing_sectors,
+        summary=summary,
+    )

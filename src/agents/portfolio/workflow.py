@@ -53,7 +53,7 @@ def volatility_router(state: PortfolioState) -> str:
     node names in the graph below.
     """
     for insight in state.stock_insights.values():
-        if insight.get("volatility", 0) > VOLATILITY_THRESHOLD:
+        if insight.volatility > VOLATILITY_THRESHOLD:
             return "high_volatility"
     return "normal"
 
@@ -70,7 +70,7 @@ def critic_router(state: PortfolioState) -> str:
     Returns "formatter" otherwise (approved, or retry budget spent).
     """
     if (
-        not state.critic_feedback.get("approved", True)
+        not state.critic_feedback.approved
         and state.critic_retry_count < _MAX_CRITIC_RETRIES
     ):
         return "retry"

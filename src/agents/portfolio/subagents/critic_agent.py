@@ -1,9 +1,11 @@
 import json
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from src.agents.base import BaseAgent
+from src.agents.portfolio.models import CriticFeedback, CriticTickerFeedback
 from src.agents.portfolio.state import PortfolioState
 from src.llm import get_llm
 from src.observability import get_telemetry_logger
@@ -48,8 +50,8 @@ Return approved=true and an empty issues list when no problems are found."""
 
 
 def _run_llm_critique(
-    decisions: Dict[str, Any],
-    user_profile: Dict[str, Any],
+    decisions: "Dict[str, Any]",
+    user_profile: "Any",
 ) -> Dict[str, Any]:
     """Call the LLM critic and return parsed JSON. Falls back to approval on any error.
 
@@ -74,18 +76,18 @@ def _run_llm_critique(
         critic_model = os.getenv("PORTFOLIO_LLM_MODEL") or None
         critic_provider = os.getenv("PORTFOLIO_LLM_PROVIDER", "ollama")
 
-    risk_level = user_profile.get("risk_level", "moderate")
-    horizon = user_profile.get("investment_horizon", "unknown")
+    risk_level = user_profile.risk_tolerance
+    horizon = user_profile.investment_horizon
 
     system_prompt = _LLM_CRITIC_SYSTEM.format(risk_level=risk_level, horizon=horizon)
 
     lines = []
     for ticker, d in decisions.items():
         lines.append(
-            f"{ticker}: action={d.get('action')} confidence={d.get('confidence')} "
-            f"gain_pct={d.get('gain_pct', 0):.1f}% "
-            f"allocation_change={d.get('allocation_change', 'n/a')} "
-            f'reason="{d.get("reason", "")}"'
+            f"{ticker}: action={d.action} confidence={d.confidence} "
+            f"gain_pct={d.gain_pct:.1f}% "
+            f"allocation_change={d.allocation_change} "
+            f'reason="{d.reason}"'
         )
     human_msg = "Portfolio decisions to review:\n\n" + "\n".join(lines)
 
@@ -112,7 +114,7 @@ def _run_llm_critique(
         return {"approved": True, "issues": [], "summary": "LLM critique unavailable."}
 
 
-class CriticAgent:
+class CriticAgent(BaseAgent):
     """
     Two-stage validation of DecisionAgent output.
 
@@ -126,55 +128,53 @@ class CriticAgent:
       quant score alignment, risk/reward coherence, and internal inconsistency
       across correlated tickers.
 
-    Sets critic_feedback["approved"] = False when a re-run is required.
-    Sets critic_feedback["feedback"] to a human-readable summary of issues
+    Sets critic_feedback.approved = False when a re-run is required.
+    Sets critic_feedback.feedback to a human-readable summary of issues
     which DecisionAgent appends to its prompt on the next retry.
     """
 
     def run(self, state: PortfolioState) -> PortfolioState:
         decisions = state.decisions
-        feedback: Dict[str, Any] = {
-            "approved": True,
-            "warnings": [],
-            "per_ticker": {},
-            "feedback": "",
-        }
+        approved = True
+        warnings: List[str] = []
+        per_ticker: Dict[str, CriticTickerFeedback] = {}
+        feedback_str = ""
 
         # ------------------------------------------------------------------
         # Stage 1: hardcoded deterministic rules
         # ------------------------------------------------------------------
-        exit_count = sum(1 for d in decisions.values() if d["action"] in ("EXIT", "REDUCE"))
+        exit_count = sum(1 for d in decisions.values() if d.action in ("EXIT", "REDUCE"))
         exit_rate = exit_count / len(decisions) if decisions else 0
 
         if exit_rate > _MAX_EXIT_RATE:
-            feedback["warnings"].append(
+            warnings.append(
                 f"High exit/reduce rate ({exit_rate:.0%}) across portfolio. "
                 f"Verify this aligns with your long-term strategy before acting."
             )
 
         for ticker, decision in decisions.items():
-            issues = []
-            conf = _CONFIDENCE_RANK.get(decision.get("confidence", "moderate"), 1)
+            issues: List[str] = []
+            conf = _CONFIDENCE_RANK.get(decision.confidence, 1)
 
             if conf == 0:  # low confidence
                 issues.append("Low confidence — gather more data before acting.")
-                feedback["approved"] = False
+                approved = False
 
-            if decision["action"] == "DOUBLE_DOWN" and decision.get("gain_pct", 0) < -20:
+            if decision.action == "DOUBLE_DOWN" and decision.gain_pct < -20:
                 issues.append("Doubling down on a >20% loss is high risk. Verify thesis first.")
-                feedback["warnings"].append(
+                warnings.append(
                     f"{ticker}: Risky double-down on large loss flagged by critic."
                 )
 
-            feedback["per_ticker"][ticker] = {
-                "status": "flagged" if issues else "ok",
-                "issues": issues,
-            }
+            per_ticker[ticker] = CriticTickerFeedback(
+                status="flagged" if issues else "ok",
+                issues=issues,
+            )
 
         # ------------------------------------------------------------------
         # Stage 2: LLM qualitative critique (only when stage 1 passes)
         # ------------------------------------------------------------------
-        if feedback["approved"]:
+        if approved:
             llm_result = _run_llm_critique(decisions, state.user_profile)
             llm_approved = llm_result.get("approved", True)
             llm_issues: list = llm_result.get("issues", [])
@@ -183,55 +183,65 @@ class CriticAgent:
             logger.info("[CriticAgent] LLM verdict: approved=%s | %s", llm_approved, llm_summary)
 
             if not llm_approved:
-                feedback["approved"] = False
+                approved = False
                 for item in llm_issues:
-                    ticker = item.get("ticker", "PORTFOLIO")
+                    t = item.get("ticker", "PORTFOLIO")
                     issue_text = item.get("issue", "")
                     if not issue_text:
                         continue
-                    entry = feedback["per_ticker"].setdefault(
-                        ticker, {"status": "ok", "issues": []}
-                    )
-                    entry["issues"].append(f"[LLM critic] {issue_text}")
-                    entry["status"] = "flagged"
+                    entry = per_ticker.get(t)
+                    if entry:
+                        entry.issues.append(f"[LLM critic] {issue_text}")
+                        per_ticker[t] = CriticTickerFeedback(
+                            status="flagged", issues=entry.issues
+                        )
+                    else:
+                        per_ticker[t] = CriticTickerFeedback(
+                            status="flagged", issues=[f"[LLM critic] {issue_text}"]
+                        )
 
             if llm_summary:
-                feedback["warnings"].append(f"LLM critic: {llm_summary}")
+                warnings.append(f"LLM critic: {llm_summary}")
 
         # ------------------------------------------------------------------
         # Build consolidated feedback string for DecisionAgent retry prompt
         # ------------------------------------------------------------------
-        if not feedback["approved"]:
+        if not approved:
             issue_lines = [
                 f"{ticker}: {issue}"
-                for ticker, data in feedback["per_ticker"].items()
-                for issue in data["issues"]
+                for ticker, entry in per_ticker.items()
+                for issue in entry.issues
             ]
-            feedback["feedback"] = "; ".join(issue_lines)
+            feedback_str = "; ".join(issue_lines)
 
-        flagged = [t for t, v in feedback["per_ticker"].items() if v["status"] == "flagged"]
+        flagged = [t for t, entry in per_ticker.items() if entry.status == "flagged"]
         get_telemetry_logger().log_event(
             "critic_review",
             {
-                "approved": feedback["approved"],
-                "warning_count": len(feedback["warnings"]),
+                "approved": approved,
+                "warning_count": len(warnings),
                 "flagged_tickers": flagged,
-                "warnings": feedback["warnings"],
+                "warnings": warnings,
             },
         )
 
-        if not feedback["approved"]:
+        if not approved:
             logger.info(
                 "[CriticAgent] REJECTED — retry will be triggered | Flagged: %s | Feedback: %s",
                 flagged,
-                feedback["feedback"],
+                feedback_str,
             )
         else:
             logger.info(
                 "[CriticAgent] APPROVED | Warnings: %d | Flagged tickers: %d",
-                len(feedback["warnings"]),
+                len(warnings),
                 len(flagged),
             )
 
-        state.critic_feedback = feedback
+        state.critic_feedback = CriticFeedback(
+            approved=approved,
+            warnings=warnings,
+            per_ticker=per_ticker,
+            feedback=feedback_str,
+        )
         return state

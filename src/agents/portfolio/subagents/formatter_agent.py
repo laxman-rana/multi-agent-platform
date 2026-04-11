@@ -1,5 +1,6 @@
 import logging
 
+from src.agents.base import BaseAgent
 from src.agents.portfolio.state import PortfolioState
 
 logger = logging.getLogger(__name__)
@@ -8,7 +9,7 @@ _ACTION_ICON = {"EXIT": "🔴", "REDUCE": "🟠", "HOLD": "🟡", "DOUBLE_DOWN":
 _SENTIMENT_ICON = {"positive": "↑", "negative": "↓", "neutral": "→"}
 
 
-class FormatterAgent:
+class FormatterAgent(BaseAgent):
     """
     Final node in the graph.
     Produces a structured, human-readable portfolio analysis report
@@ -44,9 +45,9 @@ class FormatterAgent:
             "=" * 70,
             "  PORTFOLIO ANALYSIS REPORT",
             "=" * 70,
-            f"  Investor   : {p.get('name')}",
-            f"  Risk Level : {p.get('risk_tolerance', '').capitalize()}",
-            f"  Horizon    : {p.get('investment_horizon')}",
+            f"  Investor   : {p.name}",
+            f"  Risk Level : {p.risk_tolerance.capitalize()}",
+            f"  Horizon    : {p.investment_horizon}",
             "",
         ]
 
@@ -54,10 +55,10 @@ class FormatterAgent:
         r = state.risk_metrics
         return [
             "── PORTFOLIO SUMMARY ──────────────────────────────────────────────",
-            f"  Total Value      : ${r.get('total_portfolio_value', 0):>12,.2f}",
-            f"  Unrealized P&L   : ${r.get('unrealized_pnl', 0):>+12,.2f}  ({r.get('unrealized_pnl_pct', 0):+.2f}%)",
-            f"  Weighted Vol.    : {r.get('weighted_volatility', 0):.2%}",
-            f"  Concentration    : {r.get('concentration_risk', '').upper()}",
+            f"  Total Value      : ${r.total_portfolio_value:>12,.2f}",
+            f"  Unrealized P&L   : ${r.unrealized_pnl:>+12,.2f}  ({r.unrealized_pnl_pct:+.2f}%)",
+            f"  Weighted Vol.    : {r.weighted_volatility:.2%}",
+            f"  Concentration    : {r.concentration_risk.upper()}",
             "",
         ]
 
@@ -72,19 +73,19 @@ class FormatterAgent:
     def _decisions_section(self, state: PortfolioState) -> list:
         lines = ["── STOCK DECISIONS ─────────────────────────────────────────────────"]
         for ticker, decision in state.decisions.items():
-            icon = _ACTION_ICON.get(decision["action"], "⚪")
-            insight = state.stock_insights.get(ticker, {})
-            critic_entry = state.critic_feedback.get("per_ticker", {}).get(ticker, {})
-            issues = critic_entry.get("issues", [])
+            icon = _ACTION_ICON.get(decision.action, "⚪")
+            insight = state.stock_insights.get(ticker)
+            critic_entry = state.critic_feedback.per_ticker.get(ticker)
+            issues = critic_entry.issues if critic_entry else []
 
             lines.append(
-                f"  {icon}  {ticker:<6}  {decision['action']:<13}"
-                f"[{decision['confidence'].upper()}]  "
-                f"alloc: {decision.get('allocation_change', 'n/a'):>6}  "
-                f"PnL: {decision.get('gain_pct', 0):+.1f}%  "
-                f"@ ${insight.get('price', 0):.2f}"
+                f"  {icon}  {ticker:<6}  {decision.action:<13}"
+                f"[{decision.confidence.upper()}]  "
+                f"alloc: {decision.allocation_change:>6}  "
+                f"PnL: {decision.gain_pct:+.1f}%  "
+                f"@ ${insight.price if insight else 0:.2f}"
             )
-            lines.append(f"       → {decision['reason']}")
+            lines.append(f"       → {decision.reason}")
 
             for issue in issues:
                 lines.append(f"       ⚠  {issue}")
@@ -94,32 +95,32 @@ class FormatterAgent:
 
     def _portfolio_action_section(self, state: PortfolioState) -> list:
         pa = state.portfolio_action
-        if not pa:
+        if pa is None:
             return []
 
         lines = ["── PORTFOLIO ACTION ────────────────────────────────────────────────"]
 
-        if pa.get("rebalance"):
+        if pa.rebalance:
             lines.append("  ⚠  REBALANCE RECOMMENDED")
             lines.append(
-                f"  Reduce sector  : {pa['reduce_sector']} "
-                f"(currently {pa['current_exposure']}% \u2192 target \u2264 {pa['target_exposure']})"
+                f"  Reduce sector  : {pa.reduce_sector} "
+                f"(currently {pa.current_exposure}% \u2192 target \u2264 {pa.target_exposure})"
             )
-            exits = pa.get("priority_exits", [])
+            exits = pa.priority_exits
             if exits:
                 lines.append(f"  Priority exits : {', '.join(exits)}  (already flagged for EXIT)")
         else:
             lines.append("  \u2705  Sector allocation within acceptable bounds.")
 
-        if pa.get("add_diversification"):
-            missing = pa.get("missing_sectors", [])
+        if pa.add_diversification:
+            missing = pa.missing_sectors
             lines.append(
                 f"  Diversify into : {', '.join(missing)}"
                 if missing
                 else "  Diversify into additional sectors."
             )
 
-        lines.append(f"  Summary        : {pa.get('summary', '')}")
+        lines.append(f"  Summary        : {pa.summary}")
         lines.append("")
         return lines
 
@@ -128,20 +129,20 @@ class FormatterAgent:
         for ticker, articles in state.news.items():
             lines.append(f"  {ticker}:")
             for article in articles[:3]:
-                icon = _SENTIMENT_ICON.get(article.get("sentiment", "neutral"), "→")
-                lines.append(f"    {icon}  {article['headline']}")
+                icon = _SENTIMENT_ICON.get(article.sentiment, "→")
+                lines.append(f"    {icon}  {article.headline}")
         lines.append("")
         return lines
 
     def _critic_section(self, state: PortfolioState) -> list:
         feedback = state.critic_feedback
         lines = []
-        if feedback.get("warnings"):
+        if feedback.warnings:
             lines.append("── CRITIC WARNINGS ─────────────────────────────────────────────────")
-            for w in feedback["warnings"]:
+            for w in feedback.warnings:
                 lines.append(f"  ⚠  {w}")
             lines.append("")
-        approved = feedback.get("approved", True)
+        approved = feedback.approved
         lines.append(f"  Overall Review : {'✅  APPROVED' if approved else '⛔  NEEDS REVIEW — low-confidence decisions present'}")
         return lines
 

@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+from src.agents.base import BaseAgent
+from src.agents.portfolio.models import NewsArticle, StockDecision, StockInsight
 from src.agents.portfolio.state import PortfolioState
 from src.agents.portfolio.tools.validation import validate_decision
 from src.agents.portfolio.tools.scoring import score_stock
@@ -329,15 +331,15 @@ def _format_portfolio_context(portfolio_context: Dict[str, Any]) -> str:
 
 def _build_human_message(
     ticker: str,
-    insight: Dict[str, Any],
-    news: List[Dict[str, str]],
+    insight: StockInsight,
+    news: List[NewsArticle],
     gain_pct: float,
     stock_allocation_pct: Optional[float] = None,
     portfolio_context: Optional[Dict[str, Any]] = None,
     quant_score: Optional[Dict[str, Any]] = None,
 ) -> str:
-    pe_trailing = insight.get('pe_ratio')
-    pe_forward  = insight.get('forward_pe')
+    pe_trailing = insight.pe_ratio
+    pe_forward  = insight.forward_pe
     pe_trailing_str = f"{pe_trailing:.1f}" if pe_trailing is not None else "N/A"
     pe_forward_str  = f"{pe_forward:.1f}"  if pe_forward  is not None else "N/A"
 
@@ -362,20 +364,20 @@ def _build_human_message(
     return (
         f"{score_block}"
         f"Ticker        : {ticker}\n"
-        f"Current price : ${insight['price']:.2f}\n"
-        f"Average cost  : ${insight['avg_cost']:.2f}\n"
+        f"Current price : ${insight.price:.2f}\n"
+        f"Average cost  : ${insight.avg_cost:.2f}\n"
         f"Unrealized P&L: {gain_pct:+.1f}%\n"
-        f"Daily change  : {insight['change_pct']:+.1f}%\n"
-        f"Volatility    : {insight['volatility']:.0%}  (annualised)\n"
+        f"Daily change  : {insight.change_pct:+.1f}%\n"
+        f"Volatility    : {insight.volatility:.0%}  (annualised)\n"
         f"Trailing P/E  : {pe_trailing_str}\n"
         f"Forward P/E   : {pe_forward_str}\n"
-        f"52w high/low  : ${insight.get('52w_high', 0):.2f} / ${insight.get('52w_low', 0):.2f}\n"
+        f"52w high/low  : ${insight.week_52_high:.2f} / ${insight.week_52_low:.2f}\n"
         f"{weight_line}"
         f"{portfolio_block}"
         + (
             f"\nRecent news:\n"
             + "\n".join(
-                f"  - [{n.get('sentiment', 'neutral').upper()}] {n['headline']}" for n in news
+                f"  - [{n.sentiment.upper()}] {n.headline}" for n in news
             )
             + "\n\n"
             if news
@@ -538,7 +540,7 @@ def _apply_score_confidence(result: Dict[str, Any], quant_score: Dict[str, Any])
 
 
 
-class DecisionAgent:
+class DecisionAgent(BaseAgent):
     """
     Generates a trade recommendation for each portfolio position.
 
@@ -551,42 +553,53 @@ class DecisionAgent:
         decisions: dict = {}
         telemetry = get_telemetry_logger()
         is_retry = state.critic_retry_count > 0
-        stock_allocation: Dict[str, float] = state.risk_metrics.get("stock_allocation", {})
+        stock_allocation: Dict[str, float] = state.risk_metrics.stock_allocation
 
         # Parse investment horizon once — used for scoring and prompt tuning.
-        horizon_str   = state.user_profile.get("investment_horizon", "1 year")
+        horizon_str   = state.user_profile.investment_horizon
         horizon_years = _parse_horizon_years(horizon_str)
 
         # Build the portfolio-level context once — shared across all per-ticker decisions.
         portfolio_context: Dict[str, Any] = {
-            "high_concentration":  state.risk_metrics.get("high_concentration", False),
-            "top_stock":           state.risk_metrics.get("top_stock", ""),
-            "top_stock_weight":    stock_allocation.get(state.risk_metrics.get("top_stock", ""), 0.0),
-            "concentration_risk":  state.risk_metrics.get("concentration_risk", "unknown"),
+            "high_concentration":  state.risk_metrics.high_concentration,
+            "top_stock":           state.risk_metrics.top_stock,
+            "top_stock_weight":    stock_allocation.get(state.risk_metrics.top_stock, 0.0),
+            "concentration_risk":  state.risk_metrics.concentration_risk,
             "sector_exposure":     state.sector_allocation,
             "total_positions":     len(state.portfolio),
             "investment_horizon":  horizon_str,
         }
 
+        # ── build per-ticker args list ────────────────────────────────────
+        # On retry: carry forward previously approved decisions unchanged.
+        # Only re-run tickers the critic explicitly flagged — preserves good
+        # decisions and avoids re-introducing noise into already-approved ones.
+        carried: Dict[str, StockDecision] = {}
         if is_retry:
+            for ticker, entry in state.critic_feedback.per_ticker.items():
+                if entry.status == "ok" and ticker in state.decisions:
+                    carried[ticker] = state.decisions[ticker]
+            flagged = [t for t, e in state.critic_feedback.per_ticker.items() if e.status == "flagged"]
             logger.info(
-                "[DecisionAgent] Retry #%d after critic rejection",
+                "[DecisionAgent] Retry #%d — re-running %d flagged ticker(s): %s | "
+                "carrying forward %d approved: %s",
                 state.critic_retry_count,
+                len(flagged), flagged,
+                len(carried), list(carried),
             )
 
-        # ── build per-ticker args list ────────────────────────────────────
         ticker_args: List[Tuple] = []
         for ticker, insight in state.stock_insights.items():
+            if ticker in carried:
+                continue  # skip — critic already approved this ticker's decision
             news        = state.news.get(ticker, [])
-            gain_pct    = ((insight["price"] - insight["avg_cost"]) / insight["avg_cost"]) * 100
+            gain_pct    = ((insight.price - insight.avg_cost) / insight.avg_cost) * 100
             news_score  = compute_news_score(news)
             quant_score = score_stock(insight, gain_pct, horizon_years=horizon_years, news_score=news_score)
             allocation_pct = stock_allocation.get(ticker)
-            per_ticker_feedback = state.critic_feedback.get("per_ticker", {})
+            entry = state.critic_feedback.per_ticker.get(ticker) if is_retry else None
             critic_issues: Optional[List[str]] = (
-                per_ticker_feedback.get(ticker, {}).get("issues") or None
-                if is_retry
-                else None
+                entry.issues or None if entry else None
             )
             ticker_args.append((
                 ticker, insight, news, gain_pct, allocation_pct,
@@ -595,10 +608,11 @@ class DecisionAgent:
             ))
 
         # ── parallel LLM calls ────────────────────────────────────────────
-        decisions: dict = {}
+        # Seed decisions with the carried-forward approved ones.
+        decisions: dict = dict(carried)
         quant_scores: dict = {t[0]: t[7] for t in ticker_args}  # ticker → quant_score
 
-        def _call(args: Tuple) -> Tuple[str, Dict[str, Any]]:
+        def _call(args: Tuple) -> Tuple[str, StockDecision]:
             tkr, ins, nws, gpct, alloc, issues, pctx, qscore, hyrs = args
             return tkr, self._decide(tkr, ins, nws, gpct, alloc, issues, pctx, qscore, horizon_years=hyrs)
 
@@ -623,9 +637,9 @@ class DecisionAgent:
                 "decision_made",
                 {
                     "ticker":      ticker,
-                    "action":      decision["action"],
-                    "confidence":  decision["confidence"],
-                    "gain_pct":    decision["gain_pct"],
+                    "action":      decision.action,
+                    "confidence":  decision.confidence,
+                    "gain_pct":    decision.gain_pct,
                     "news_count":  len(state.news.get(ticker, [])),
                     "retry":       is_retry,
                     "quant_score": quant_score["score"],
@@ -635,9 +649,9 @@ class DecisionAgent:
             logger.info(
                 "[DecisionAgent] %s: %-13s [%s]  gain: %+.1f%%  score: %+d (%s)%s",
                 ticker,
-                decision["action"],
-                decision["confidence"].upper(),
-                decision["gain_pct"],
+                decision.action,
+                decision.confidence.upper(),
+                decision.gain_pct,
                 quant_score["score"],
                 quant_score["tier"],
                 alloc_note,
@@ -652,28 +666,28 @@ class DecisionAgent:
             portfolio=state.portfolio,
         )
         state.portfolio_action = portfolio_action
-        if portfolio_action.get("rebalance"):
+        if portfolio_action.rebalance:
             logger.info(
                 "[DecisionAgent] Portfolio action: REBALANCE | %s %.1f%% → %s | Priority exits: %s",
-                portfolio_action["reduce_sector"],
-                portfolio_action["current_exposure"],
-                portfolio_action["target_exposure"],
-                portfolio_action["priority_exits"] or "none",
+                portfolio_action.reduce_sector,
+                portfolio_action.current_exposure,
+                portfolio_action.target_exposure,
+                portfolio_action.priority_exits or "none",
             )
         return state
 
     def _decide(
         self,
         ticker: str,
-        insight: Dict[str, Any],
-        news: List[Dict[str, str]],
+        insight: StockInsight,
+        news: List[NewsArticle],
         gain_pct: float,
         stock_allocation_pct: Optional[float] = None,
         critic_issues: Optional[List[str]] = None,
         portfolio_context: Optional[Dict[str, Any]] = None,
         quant_score: Optional[Dict[str, Any]] = None,
         horizon_years: float = 1.0,
-    ) -> Dict[str, Any]:
+    ) -> StockDecision:
         telemetry = get_telemetry_logger()
         human_msg = _build_human_message(
             ticker, insight, news, gain_pct, stock_allocation_pct, portfolio_context, quant_score
@@ -717,7 +731,7 @@ class DecisionAgent:
                 valid, val_err = validate_decision(result)
                 if not valid:
                     raise ValueError(val_err)
-                return result
+                return StockDecision.model_validate(result)
             except (json.JSONDecodeError, KeyError, ValueError) as exc:
                 last_error = exc
                 if attempt == 0:

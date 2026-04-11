@@ -1,4 +1,7 @@
-from typing import Dict, List
+from typing import Dict, List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.agents.portfolio.models import NewsArticle
 
 
 def _score_sentiment(headline: str) -> str:
@@ -88,7 +91,7 @@ def get_news(ticker: str) -> List[Dict[str, str]]:
         return []
 
 
-def compute_news_score(articles: List[Dict[str, str]]) -> int:
+def compute_news_score(articles: "List[NewsArticle]") -> int:
     """
     Aggregate article sentiments into a single signal: +1, 0, or -1.
 
@@ -107,7 +110,7 @@ def compute_news_score(articles: List[Dict[str, str]]) -> int:
     if not articles:
         return 0
     _MAP = {"positive": 1, "neutral": 0, "negative": -1}
-    total = sum(_MAP.get(a.get("sentiment", "neutral"), 0) for a in articles)
+    total = sum(_MAP.get(a.sentiment, 0) for a in articles)
     if total > 0:
         return 1
     if total < 0:
