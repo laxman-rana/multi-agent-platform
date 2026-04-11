@@ -630,7 +630,7 @@ class DecisionAgent(BaseAgent):
 
         # ── telemetry + logging (sequential, after all futures done) ──────
         for ticker, decision in decisions.items():
-            quant_score    = quant_scores[ticker]
+            quant_score    = quant_scores.get(ticker, {"score": 0, "tier": "carried"})
             allocation_pct = stock_allocation.get(ticker)
             alloc_note     = f" weight={allocation_pct:.1f}%" if allocation_pct is not None else ""
             telemetry.log_event(
