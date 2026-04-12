@@ -3,7 +3,19 @@ import logging
 from langchain.tools import tool
 from traceloop.sdk.decorators import workflow
 
+from .mock_data import ORDERS
+
 logger = logging.getLogger(__name__)
+
+
+@tool
+def get_order_details(order_id: str) -> dict:
+    """Retrieve full order details for a given order ID."""
+    order = ORDERS.get(order_id)
+    if order is None:
+        return {"error": f"Order '{order_id}' not found."}
+    logger.info("[Tool] get_order_details | order_id=%s | result=%s", order_id, order)
+    return order
 
 
 @tool
@@ -42,4 +54,4 @@ def update_address_for_order(order_id: str, shipping_address: dict) -> str:
     return "address_updated"
 
 
-TOOLS = [send_customer_message, issue_refund, cancel_order, update_address_for_order]
+TOOLS = [get_order_details, send_customer_message, issue_refund, cancel_order, update_address_for_order]

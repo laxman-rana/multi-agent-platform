@@ -9,3 +9,6 @@ traceloop-sdk==0.53.3
 yfinance>=0.2.40
 vaderSentiment>=3.3.2
 feedparser>=6.0.0
+
+mem0ai==1.0.11
+python-dotenv>=1.0.0
