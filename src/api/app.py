@@ -13,6 +13,13 @@ from src.api.supervisor_service import run_supervisor_query
 from src.integrations.whatsapp import extract_tickers_from_text, format_opportunity_reply
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _parse_cors_origins() -> list[str]:
     raw = os.getenv("API_CORS_ALLOW_ORIGINS", "*").strip()
     if not raw:
@@ -62,6 +69,9 @@ class WhatsAppWebhookResponse(BaseModel):
     reply_text: str
 
 
+_DOCS_ENABLED = _env_flag("API_ENABLE_DOCS", default=True)
+
+
 app = FastAPI(
     title="Multi-Agent Platform API",
     version="0.1.0",
@@ -69,6 +79,9 @@ app = FastAPI(
         "HTTP API for the opportunity scanner agent. "
         "The existing CLI remains unchanged."
     ),
+    docs_url="/docs" if _DOCS_ENABLED else None,
+    redoc_url="/redoc" if _DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if _DOCS_ENABLED else None,
 )
 
 app.add_middleware(
@@ -82,15 +95,17 @@ app.add_middleware(
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {
+    payload = {
         "service": "multi-agent-platform",
         "status": "ok",
-        "docs": "/docs",
         "health": "/health",
         "opportunity_scan": "/api/v1/opportunity/scan",
         "assistant_query": "/api/v1/assistant/query",
         "whatsapp_webhook": "/webhooks/whatsapp",
     }
+    if _DOCS_ENABLED:
+        payload["docs"] = "/docs"
+    return payload
 
 
 @app.get("/health")

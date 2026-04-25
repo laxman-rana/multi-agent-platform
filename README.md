@@ -181,6 +181,8 @@ python -m src.api.server
 
 For browser frontends, configure `API_CORS_ALLOW_ORIGINS` with a comma-separated list of allowed origins.
 
+For production, you can disable interactive API docs with `API_ENABLE_DOCS=false`.
+
 The WhatsApp webhook endpoint accepts an inbound message payload, extracts ticker symbols from text like `scan nvda msft`, runs the same opportunity scan service, and returns a reply payload your messaging provider integration can send back to the user.
 
 ## Technologies Used
