@@ -69,7 +69,7 @@ Each agent package can define its own:
 - `src/agents/opportunity/nodes/`: AlphaScannerAgent, NewsNode, DecisionNode
 - `src/agents/opportunity/markets/`: MarketStrategy (US, IN, IN_MID, IN_SMALL)
 - `src/agents/opportunity/state.py`: `OpportunityState` dataclass
-- `src/requirements.txt`: Python dependencies
+- `requirements.txt`: Python dependencies
 
 ## Quick Start
 
@@ -218,7 +218,7 @@ Create and activate a virtual environment, then install dependencies.
 ```powershell
 cd D:\projects\agents
 .\.venv\Scripts\Activate.ps1
-pip install -r src\requirements.txt
+pip install -r requirements.txt
 ```
 
 ## Environment Variables

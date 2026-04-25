@@ -3,7 +3,7 @@ set "ROOT=%~dp0"
 cd /d "%ROOT%"
 
 set "VENV_DIR=.venv"
-set "REQ_FILE=src\requirements.txt"
+set "REQ_FILE=requirements.txt"
 
 if not exist "%REQ_FILE%" (
     echo [ERROR] Requirements file not found: %REQ_FILE%
