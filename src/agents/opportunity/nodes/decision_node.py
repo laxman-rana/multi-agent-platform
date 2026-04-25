@@ -81,7 +81,7 @@ class DecisionNode:
 
         def _cache_key(tkr: str) -> str:
             sig = state.signals[tkr]
-            return f"{tkr}:{sig['score']}:{sig['type']}"
+            return f"{tkr}:{sig['quality_score']}:{sig['type']}"
 
         def _decide(tkr: str) -> Tuple[str, Dict[str, Any], float]:
             key   = _cache_key(tkr)
@@ -154,16 +154,19 @@ class DecisionNode:
                 {
                     "ticker":     ticker,
                     "score":      signal_result["score"],
+                    "quality_score": signal_result.get("quality_score"),
                     "action":     decision["action"],
                     "confidence": decision["confidence"],
                     "latency_ms": latency_ms,
                 },
             )
             logger.info(
-                "[DecisionNode] %s → %s (%s) | score=%+d | %.0fms%s",
+                "[DecisionNode] %s → %s (%s) | risk=%s | horizon=%s | score=%+d | %.0fms%s",
                 ticker,
-                decision["action"],
+                decision.get("decision", decision["action"]),
                 decision["confidence"],
+                decision.get("risk_level", "unknown"),
+                decision.get("time_horizon_bias", "unknown"),
                 signal_result["score"],
                 latency_ms,
                 " [cached]" if latency_ms == 0.0 else "",
@@ -253,22 +256,40 @@ class DecisionNode:
 
             news_sent = state.news_sentiment.get(ticker, {})
             buy_entry = {
-                "ticker":                ticker,
-                "action":                "BUY SIGNAL",
-                "confidence":            decision["confidence"],
-                "entry_quality":         decision["entry_quality"],
-                "reason":                decision["reason"],
-                "type":                  decision["type"],
-                "score":                 signal_result["score"],
-                "opportunity_score":     signal_result.get("opportunity_score"),
-                "signals":               signal_result["signals"],
-                "sector":                sector,
-                "current_position_pct":  current_position,
-                "sector_allocation_pct": current_sector_pct,
-                "portfolio_warnings":    portfolio_warnings,
-                "portfolio_hints":       portfolio_hints,
-                "news_sentiment":        news_sent.get("sentiment", "neutral"),
-                "news_catalyst":         news_sent.get("catalyst", ""),
+                "ticker":                 ticker,
+                "action":                 "BUY SIGNAL",
+                # ── Decision tier ─────────────────────────────────────
+                "decision":               decision.get("decision", decision["action"]),
+                "confidence":             decision["confidence"],
+                "entry_quality":          decision["entry_quality"],
+                "risk_level":             decision.get("risk_level", "medium"),
+                "time_horizon_bias":      decision.get("time_horizon_bias", "long_term"),
+                "news_impact":            decision.get("news_impact", "none"),
+                # ── LLM enrichment fields (new) ───────────────────────
+                "thesis_type":            decision.get("thesis_type", ""),
+                "risk_breakdown":         decision.get("risk_breakdown", {}),
+                "key_signals":            decision.get("key_signals", decision.get("key_supporting_signals", [])),
+                "entry_triggers":         decision.get("entry_triggers", []),
+                "position_sizing":        decision.get("position_sizing", {}),
+                "notes":                  decision.get("notes", []),
+                # ── Legacy fields (kept for backward compat) ──────────
+                "key_supporting_signals": decision.get("key_signals", decision.get("key_supporting_signals", [])),
+                "risk_factors":           decision.get("risk_factors", []),
+                "reason":                 decision["reason"],
+                "type":                   decision["type"],
+                "score":                  signal_result["score"],
+                "quality_score":          signal_result.get("quality_score", signal_result["score"]),
+                "quality_tier":           signal_result.get("quality_tier"),
+                "quality_signals":        signal_result.get("quality_signals", signal_result["signals"]),
+                "opportunity_score":      signal_result.get("opportunity_score"),
+                "signals":                signal_result["signals"],
+                "sector":                 sector,
+                "current_position_pct":   current_position,
+                "sector_allocation_pct":  current_sector_pct,
+                "portfolio_warnings":     portfolio_warnings,
+                "portfolio_hints":        portfolio_hints,
+                "news_sentiment":         news_sent.get("sentiment", "neutral"),
+                "news_catalyst":          news_sent.get("catalyst", ""),
                 "suggested_position_size": suggested_position_size,
             }
             state.buy_opportunities.append(buy_entry)
@@ -278,6 +299,8 @@ class DecisionNode:
                 {
                     "ticker":                ticker,
                     "score":                 signal_result["score"],
+                    "quality_score":         signal_result.get("quality_score", signal_result["score"]),
+                    "quality_tier":          signal_result.get("quality_tier"),
                     "confidence":            decision["confidence"],
                     "entry_quality":         decision["entry_quality"],
                     "type":                  decision["type"],
@@ -318,6 +341,11 @@ class DecisionNode:
                 "[DecisionNode] %d BUY signals → capping to top %d (max_concurrent_buys)",
                 len(state.buy_opportunities), _MAX_CONCURRENT_BUYS,
             )
+            # Track capped tickers so workflow can display them with full context
+            capped = state.buy_opportunities[_MAX_CONCURRENT_BUYS:]
+            if not hasattr(state, "capped_opportunities"):
+                state.capped_opportunities = []
+            state.capped_opportunities.extend(capped)
             state.buy_opportunities = state.buy_opportunities[:_MAX_CONCURRENT_BUYS]
 
         # ── scan summary telemetry ─────────────────────────────────────────

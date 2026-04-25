@@ -37,6 +37,7 @@ import argparse
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -229,19 +230,14 @@ def build_graph():
 # ---------------------------------------------------------------------------
 
 
-def run(query: str, model: str | None = None) -> str:
-    """Run the supervisor graph with a natural-language query.
+@dataclass
+class SupervisorRunResult:
+    answer: str
+    worker_results: dict[str, str]
 
-    Parameters
-    ----------
-    query : The user's question or instruction in plain English.
-    model : Optional model name override. Provider is inferred automatically
-            from the model name (e.g. 'gpt-4o' → openai, 'llama3' → ollama).
 
-    Returns
-    -------
-    The supervisor's final natural-language answer as a plain string.
-    """
+def run_full(query: str, model: str | None = None) -> SupervisorRunResult:
+    """Run the supervisor graph and return the final answer plus worker outputs."""
     if model:
         from src.llm.providers import infer_provider
 
@@ -257,11 +253,32 @@ def run(query: str, model: str | None = None) -> str:
     result = compiled.invoke(initial_state)
 
     messages = result.get("messages", [])
+    answer = "Supervisor completed but returned no final answer."
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and msg.content and not getattr(msg, "tool_calls", None):
-            return str(msg.content)
+            answer = str(msg.content)
+            break
 
-    return "Supervisor completed but returned no final answer."
+    return SupervisorRunResult(
+        answer=answer,
+        worker_results=result.get("worker_results", {}),
+    )
+
+
+def run(query: str, model: str | None = None) -> str:
+    """Run the supervisor graph with a natural-language query.
+
+    Parameters
+    ----------
+    query : The user's question or instruction in plain English.
+    model : Optional model name override. Provider is inferred automatically
+            from the model name (e.g. 'gpt-4o' → openai, 'llama3' → ollama).
+
+    Returns
+    -------
+    The supervisor's final natural-language answer as a plain string.
+    """
+    return run_full(query=query, model=model).answer
 
 
 # ---------------------------------------------------------------------------

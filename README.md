@@ -25,6 +25,8 @@ Three agents are currently implemented:
 - **Portfolio analysis agent** — LangGraph multi-agent pipeline that analyses an investor's equity portfolio using live market data and an LLM to produce hold/reduce/exit/double-down recommendations with actionable allocation changes
 - **Opportunity scanner agent** — 3-node LangGraph pipeline that scans live equity markets (US S&P 500, NIFTY 50/MIDCAP 100/SMALLCAP 100) for high-quality BUY signals using a composite opportunity score (signal strength, analyst upside, volume spike, idea freshness), news sentiment, and LLM verdict
 
+The opportunity scanner is available as both a CLI workflow and an HTTP API for frontend or messaging integrations.
+
 The goal is to use the same shared foundation for additional agents such as fulfillment, finance, operations, HR, or other domain-specific assistants.
 
 ## Project Overview
@@ -149,6 +151,37 @@ python -m src.agents.opportunity.workflow --top-n 200 --interval 10
 ```
 
 See [src/agents/opportunity/README.md](src/agents/opportunity/README.md) for full documentation.
+
+### Opportunity scanner API
+
+```powershell
+python -m src.api.server
+```
+
+Available endpoints:
+
+- `GET /health`
+- `GET /docs`
+- `POST /api/v1/opportunity/scan`
+- `POST /webhooks/whatsapp`
+
+Example request:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/opportunity/scan ^
+  -H "Content-Type: application/json" ^
+  -d "{\"tickers\":[\"AAPL\",\"MSFT\",\"NVDA\"]}"
+```
+
+The API reads `PORT` automatically, so a Railway start command can be:
+
+```bash
+python -m src.api.server
+```
+
+For browser frontends, configure `API_CORS_ALLOW_ORIGINS` with a comma-separated list of allowed origins.
+
+The WhatsApp webhook endpoint accepts an inbound message payload, extracts ticker symbols from text like `scan nvda msft`, runs the same opportunity scan service, and returns a reply payload your messaging provider integration can send back to the user.
 
 ## Technologies Used
 

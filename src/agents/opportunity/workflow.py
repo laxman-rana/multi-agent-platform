@@ -1,11 +1,11 @@
 """
 workflow.py
 -----------
-Entry point for the AlphaScannerAgent BUY-opportunity scanning workflow.
+Entry point for the AlphaScannerAgent quality-first BUY-opportunity workflow.
 
 Run from the repository root:
 
-    # Single scan — US market (S&P 500), useful outside market hours for testing
+    # Single scan — US market (large + mid cap), useful outside market hours for testing
     python -m src.agents.opportunity.workflow --tickers AAPL MSFT NVDA --once
 
     # Continuous batch scan every 15 minutes while the US market is open
@@ -37,6 +37,7 @@ from src.agents.opportunity.nodes.alpha_scanner_agent import AlphaScannerAgent
 from src.agents.opportunity.nodes.news_node import NewsNode
 from src.agents.opportunity.nodes.decision_node import DecisionNode
 from src.agents.opportunity.markets.market_strategy import get_liquid_universe, get_market_strategy
+from src.agents.opportunity.providers.factory import create_market_data_provider
 from src.agents.opportunity.state import OpportunityState
 from src.observability import get_telemetry_logger
 
@@ -72,7 +73,7 @@ def build_graph():
         [scanner] → [news] → [decision] → END
     """
     graph = StateGraph(OpportunityState)
-    graph.add_node("scanner",  AlphaScannerAgent().run)
+    graph.add_node("scanner",  AlphaScannerAgent(create_market_data_provider()).run)
     graph.add_node("news",     NewsNode().run)
     graph.add_node("decision", DecisionNode().run)
     graph.set_entry_point("scanner")
@@ -101,7 +102,7 @@ def trigger_scan(
               set, the dynamic liquid universe is used instead.
     top_n   : when tickers is None, scan the top-N most liquid tickers
               from the built-in universe (default: 200).
-    market  : "US" for S&P 500 / NYSE (default), "IN" for NIFTY 50 / NSE.
+    market  : "US" for large + mid cap / NYSE (default), "IN" for NIFTY 50 / NSE.
 
     Returns
     -------
@@ -168,13 +169,13 @@ def run_batch_scan(
         )
 
         if opportunities:
-            logger.info("[Workflow] %d BUY opportunities this cycle:", len(opportunities))
+            logger.info("[Workflow] %d quality-ranked BUY opportunities this cycle:", len(opportunities))
             for opp in opportunities:
                 logger.info(
-                    "  %-6s | %-8s | score=%+d | %s",
+                    "  %-6s | %-8s | q=%+d | %s",
                     opp["ticker"],
                     opp["confidence"],
-                    opp["score"],
+                    opp.get("quality_score", opp["score"]),
                     opp["reason"][:80],
                 )
         else:
@@ -229,10 +230,10 @@ def main(
     )
 
     logger.info("=" * 60)
-    logger.info("STARTING ALPHA SCANNER WORKFLOW")
+    logger.info("STARTING QUALITY STOCK WORKFLOW")
     logger.info("=" * 60)
     logger.info("Provider : %s  |  Model : %s", resolved_provider, resolved_model)
-    logger.info("Market   : %s", "US (S&P 500 / NYSE)" if market.upper() == "US" else "IN (NIFTY 50 / NSE)")
+    logger.info("Market   : %s", "US (Large + Mid Cap / NYSE)" if market.upper() == "US" else "IN (NIFTY 50 / NSE)")
     logger.info("Tickers  : %s", tickers or f"[dynamic top-{top_n or 200}]")
 
     if not tickers and not top_n:
@@ -369,8 +370,8 @@ def _build_low_score_reason(
     state: "OpportunityState",
 ) -> str:
     """Construct a human-readable explanation for a ticker that scored too low."""
-    score   = sig.get("score", 0)
-    signals = sig.get("signals", [])
+    score   = sig.get("quality_score", sig.get("score", 0))
+    signals = sig.get("quality_signals", sig.get("signals", []))
     mdata   = state.market_data.get(ticker, {})
     news    = state.news_sentiment.get(ticker)
 
@@ -384,11 +385,11 @@ def _build_low_score_reason(
 
     # Signal balance
     if score < 0:
-        parts.append("bearish signals outweigh bullish")
+        parts.append("quality risks outweigh quality signals")
     elif signals:
-        parts.append("signals are mixed — no dominant bullish catalyst")
+        parts.append("fundamentals are mixed — no durable quality thesis dominates")
     else:
-        parts.append("no meaningful buy signals detected")
+        parts.append("no meaningful quality signals detected")
 
     # Analyst sentiment
     if analyst in ("sell", "strong sell", "underperform"):
@@ -399,9 +400,7 @@ def _build_low_score_reason(
     # Valuation trend
     if pe and fpe:
         if fpe >= pe:
-            parts.append(
-                f"earnings growth not priced in (fwd P/E {fpe:.1f} ≥ trailing {pe:.1f})"
-            )
+            parts.append(f"valuation does not improve (fwd P/E {fpe:.1f} ≥ trailing {pe:.1f})")
 
     # Price movement
     if change_pct is not None and abs(change_pct) < 1.0:
@@ -411,14 +410,47 @@ def _build_low_score_reason(
     if news and news.get("sentiment", "neutral").lower() in ("negative", "bearish"):
         parts.append("negative news sentiment")
 
-    # Volatility — low vol means less opportunity
-    if volatility is not None and volatility < 0.20:
-        parts.append(f"low volatility ({volatility:.0%}) — limited near-term price catalyst")
+    if volatility is not None and volatility > 0.45:
+        parts.append(f"high volatility ({volatility:.0%}) adds execution risk")
 
     if not parts:
-        parts.append(f"insufficient conviction (score {score:+d})")
+        parts.append(f"insufficient quality conviction (score {score:+d})")
 
     return "; ".join(parts).capitalize() + "."
+
+
+
+def _missing_quality_signals(sig: Dict[str, Any]) -> str:
+    """
+    For a watchlist-alert ticker, describe what quality signal(s) would
+    push it over the BUY threshold — helps the user know what to watch for.
+    """
+    active = {s.lower() for s in sig.get("quality_signals", sig.get("signals", []))}
+
+    missing: List[str] = []
+
+    # Check which Tier 1 signals are absent
+    has_profit  = any("profit margin" in s for s in active)
+    has_roe     = any("return on equity" in s for s in active)
+    has_fcf     = any("fcf yield" in s for s in active)
+    has_opmargin = any("operating margin" in s for s in active)
+    has_balance = any("debt-to-equity" in s and "investment-grade" in s for s in active)
+
+    if not has_profit:
+        missing.append("profit margin ≥10% (durable profitability)")
+    if not has_roe:
+        missing.append("ROE ≥15% (capital efficiency)")
+    if not has_fcf:
+        missing.append("FCF yield ≥2% (self-funded growth)")
+    if not has_opmargin:
+        missing.append("operating margin ≥12% (pricing power)")
+    if not has_balance and not any("leverage" in s for s in active):
+        missing.append("D/E ≤0.75 (investment-grade balance sheet)")
+
+    if not missing:
+        return "confirm margin or FCF improvement in next earnings"
+
+    return " | ".join(missing[:2])  # show top 2 gaps only
 
 
 def _print_ticker_detail(
@@ -427,11 +459,15 @@ def _print_ticker_detail(
     state: "OpportunityState",
     reason: str,
     confidence: Optional[str] = None,
+    decision: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Print a full detail block for one ticker (shared by all rejection groups)."""
     score     = sig.get("score", 0)
+    quality_score = sig.get("quality_score", score)
     score_str = f"{score:+d}" if isinstance(score, int) else str(score)
+    quality_str = f"{quality_score:+d}" if isinstance(quality_score, int) else str(quality_score)
     tier      = sig.get("tier", "?")
+    quality_tier = sig.get("quality_tier", tier)
     mdata     = state.market_data.get(ticker, {})
     news      = state.news_sentiment.get(ticker)
 
@@ -489,11 +525,24 @@ def _print_ticker_detail(
     override        = sig.get("override_reason")
     override_line   = f"\n  \u26a1 Override  : EVENT OVERRIDE \u2014 large move near 52-week low (bypass score gate)" if override else ""
 
+    risk_level    = decision.get("risk_level", "") if decision else ""
+    time_horizon  = decision.get("time_horizon_bias", "") if decision else ""
+    news_impact   = decision.get("news_impact", "") if decision else ""
+    risk_factors  = decision.get("risk_factors", []) if decision else []
+    risk_line     = f"\n  Risk       : {risk_level.upper()}  |  Horizon: {time_horizon}  |  News impact: {news_impact}" if risk_level else ""
+    risk_fac_text = ("\n" + "\n".join(f"               - {r}" for r in risk_factors)) if risk_factors else ""
+
+    # "What would change this" — missing Tier 1 signals
+    watch_for = _missing_quality_signals(sig)
+
     print(
         f"\n  Ticker     : {ticker}{price_line}{cap_line}{sector_line}"
-        f"\n  Score      : {score_str}  ({tier}){confidence_line}{override_line}"
+        f"\n  Score      : {quality_str}  ({quality_tier})"
+        f"\n  Legacy     : {score_str}  ({tier}){confidence_line}{override_line}"
         f"\n  Analyst    : {analyst_line}{valuation_line}{news_line}"
+        f"{risk_line}{risk_fac_text}"
         f"\n  Reason     : {reason}"
+        f"\n  Watch for  : {watch_for}"
         f"\n  Signals    :\n{signals_text}"
     )
 
@@ -540,10 +589,63 @@ def _print_ignored(state: "OpportunityState") -> None:
         if dec.get("action") == "IGNORE":
             llm_ignored.append((ticker, sig, dec))
 
+    # Also gather capped tickers (qualified BUY but excluded by position cap)
+    capped = getattr(state, "capped_opportunities", [])
+
     divider = "=" * 60
     print(f"\n{divider}")
     print(f"STOCKS SCANNED — NOT RECOMMENDED ({len(not_recommended)} ticker(s))")
     print(divider)
+
+    # 0. Capped opportunities — qualified BUY, excluded only by max_concurrent_buys
+    if capped:
+        capped_sorted = sorted(capped, key=lambda x: x.get("quality_score", x.get("score", 0)), reverse=True)
+        print(f"\n  [ \U0001f4cc QUALIFIED BUT CAPPED — strong signal, position limit reached: {len(capped)} ]")
+        for opp in capped_sorted:
+            t         = opp["ticker"]
+            qs        = opp.get("quality_score", opp["score"])
+            qt        = opp.get("quality_tier", "")
+            dec       = opp.get("decision", "BUY")
+            thesis    = opp.get("thesis_type", "").replace("_", " ").title()
+            conf      = opp.get("confidence", "")
+            rb        = opp.get("risk_breakdown", {})
+            reason    = opp.get("reason", "")
+            ps        = opp.get("position_sizing", {})
+            triggers  = opp.get("entry_triggers", [])
+            ks        = opp.get("key_signals", [])
+            mdata     = state.market_data.get(t, {})
+            price     = mdata.get("price", 0.0)
+            change_pct = mdata.get("change_pct", 0.0)
+            fwd_pe    = mdata.get("forward_pe")
+            fwd_pe_s  = f"{fwd_pe:.1f}" if fwd_pe else "N/A"
+            h52, l52  = mdata.get("52w_high", 0.0), mdata.get("52w_low", 0.0)
+            range_pos = f"{(price - l52) / (h52 - l52):.0%}" if h52 > l52 else "N/A"
+            v_ = rb.get("volatility_risk",  "?").upper()
+            f_ = rb.get("fundamental_risk", "?").upper()
+            s_ = rb.get("sentiment_risk",   "?").upper()
+            ps_type  = ps.get("type", "starter").upper()
+            ps_range = ps.get("range", "")
+            print(
+                f"\n  Ticker     : {t}"
+                f"\n  Decision   : {dec}  ({qt})  — capped by position limit, NOT a quality issue"
+                f"\n  Thesis     : {thesis}  |  Confidence: {conf}"
+                f"\n  Score      : {qs:+d}"
+                f"\n  Price      : ${price:.2f}  ({change_pct:+.2f}%)  |  52w position: {range_pos}"
+                f"\n  Fwd P/E    : {fwd_pe_s}"
+                f"\n  Risk       : Volatility={v_}  |  Fundamental={f_}  |  Sentiment={s_}"
+                f"\n  Would size : {ps_type}  {ps_range}  if cap were raised"
+            )
+            if ks:
+                print("  Key Signals:")
+                for s in ks:
+                    print(f"      \u2713  {s}")
+            if triggers:
+                print("  Why still interesting:")
+                for t_ in triggers:
+                    print(f"      \u2192  {t_}")
+            if reason:
+                print(f"  Reason     : {reason}")
+            print(f"  Action     : Monitor — add to next scan cycle if position cap is raised")
 
     # 1. LLM IGNOREs — full detail (highest score first)
     if llm_ignored:
@@ -554,13 +656,67 @@ def _print_ignored(state: "OpportunityState") -> None:
                 ticker, sig, state,
                 reason=dec.get("reason", "N/A"),
                 confidence=dec.get("confidence"),
+                decision=dec,
             )
 
-    # 2. Low score / cooldown — full detail block (same format as LLM IGNORE)
-    if low_score:
-        low_score.sort(key=lambda x: x[1].get("score", 0), reverse=True)
-        print(f"\n  [ Passed activity filter but signal score too low (< {_CANDIDATE_MIN_SCORE}): {len(low_score)} ]")
-        for ticker, sig in low_score:
+    # 2. Split low_score into watchlist alerts vs genuinely weak
+    _WATCHLIST_ALERT_SCORE = _CANDIDATE_MIN_SCORE - 1   # == 4 with current threshold
+    _WATCHLIST_52W_PCT     = 0.05                        # bottom 5% of 52w range
+
+    watchlist_alerts: list = []
+    genuine_low: list = []
+
+    for ticker, sig in low_score:
+        score_val = sig.get("score", 0)
+        mdata     = state.market_data.get(ticker, {})
+        price     = mdata.get("price", 0.0)
+        high_52   = mdata.get("52w_high", 0.0)
+        low_52    = mdata.get("52w_low",  0.0)
+        in_bottom = False
+        if high_52 and low_52 and high_52 > low_52 and price:
+            pct_in_range = (price - low_52) / (high_52 - low_52)
+            in_bottom = pct_in_range <= _WATCHLIST_52W_PCT
+        if score_val == _WATCHLIST_ALERT_SCORE and in_bottom:
+            watchlist_alerts.append((ticker, sig))
+        else:
+            genuine_low.append((ticker, sig))
+
+    # 2a. Watchlist alerts — rich detail block
+    if watchlist_alerts:
+        watchlist_alerts.sort(key=lambda x: x[1].get("score", 0), reverse=True)
+        print(f"\n  [ \u26a1 WATCHLIST ALERT \u2014 near 52w low, one quality signal away from BUY: {len(watchlist_alerts)} ]")
+        for ticker, sig in watchlist_alerts:
+            mdata    = state.market_data.get(ticker, {})
+            price    = mdata.get("price", 0.0)
+            high_52  = mdata.get("52w_high", 0.0)
+            low_52   = mdata.get("52w_low", 0.0)
+            pct_pos  = f"{(price - low_52) / (high_52 - low_52):.0%}" if high_52 > low_52 else "N/A"
+            fwd_pe   = mdata.get("forward_pe")
+            fwd_pe_s = f"{fwd_pe:.1f}" if fwd_pe else "N/A"
+            a_count  = mdata.get("analyst_count", 0) or 0
+            a_tgt    = mdata.get("analyst_target")
+            a_upside = f"+{((a_tgt - price) / price):.0%}" if a_tgt and price else "N/A"
+            rev_g    = mdata.get("revenue_growth")
+            rev_s    = f"{rev_g:.0%}" if rev_g is not None else "N/A"
+            sig_score = sig.get("score", 0)
+            sig_tier  = sig.get("quality_tier", "watchlist")
+            missing   = _missing_quality_signals(sig)
+            print(
+                f"\n  Ticker     : {ticker}"
+                f"\n  Price      : ${price:.2f}  |  52w position: {pct_pos} of range (bottom {int(_WATCHLIST_52W_PCT*100)}%)"
+                f"\n  Score      : {sig_score:+d}  ({sig_tier})  \u2014  ONE signal short of BUY threshold ({_CANDIDATE_MIN_SCORE})"
+                f"\n  Fwd P/E    : {fwd_pe_s}  |  Revenue growth: {rev_s}  |  Analyst upside: {a_upside} ({a_count} analysts)"
+                f"\n  Watch for  : {missing}"
+                f"\n  Signals    :"
+            )
+            for s in sig.get("quality_signals", sig.get("signals", [])):
+                print(f"      - {s}")
+
+    # 2b. Genuinely low score — full detail
+    if genuine_low:
+        genuine_low.sort(key=lambda x: x[1].get("score", 0), reverse=True)
+        print(f"\n  [ Passed activity filter but signal score too low (< {_CANDIDATE_MIN_SCORE}): {len(genuine_low)} ]")
+        for ticker, sig in genuine_low:
             _print_ticker_detail(ticker, sig, state, reason=_build_low_score_reason(ticker, sig, state))
 
     if on_cooldown:
@@ -591,7 +747,7 @@ def _print_opportunities(opportunities: List[Dict[str, Any]]) -> None:
     light   = "-" * 60
 
     print(f"\n{heavy}")
-    print(f"ALPHA SCANNER — SIGNALS DETECTED ({len(opportunities)} found)")
+    print(f"QUALITY STOCK SCANNER — BUY SIGNALS ({len(opportunities)} found)")
     print(heavy)
 
     if not opportunities:
@@ -602,6 +758,8 @@ def _print_opportunities(opportunities: List[Dict[str, Any]]) -> None:
     for opp in opportunities:
         ticker        = opp["ticker"]
         score         = opp["score"]
+        quality_score = opp.get("quality_score", score)
+        quality_tier  = opp.get("quality_tier", "")
         opp_score     = opp.get("opportunity_score")
         tier          = opp.get("tier", "")
         confidence    = opp["confidence"]
@@ -615,20 +773,66 @@ def _print_opportunities(opportunities: List[Dict[str, Any]]) -> None:
 
         # ── Section 1: signal header ──────────────────────────────────────
         print(f"\n{heavy}")
-        print("ALPHA SIGNAL — OPPORTUNITY DETECTED")
+        print("QUALITY SIGNAL — OPPORTUNITY DETECTED")
         print(heavy)
 
+        decision_tier  = opp.get("decision", opp["action"])
+        _raw_thesis    = opp.get("thesis_type", "").strip()
+        if not _raw_thesis:
+            # Fallback: derive from internal opportunity type
+            _otype_map = {
+                "elite_compounder":       "quality_compounder",
+                "quality_value_compounder": "quality_compounder",
+                "compounder":             "quality_compounder",
+                "quality_value":          "value_play",
+                "quality_watchlist":      "high_growth_speculative",
+            }
+            _raw_thesis = _otype_map.get(opp.get("type", ""), "high_growth_speculative")
+        thesis_type = _raw_thesis.replace("_", " ").title()
+        risk_level     = opp.get("risk_level", "").upper()
+        risk_breakdown = opp.get("risk_breakdown", {})
+        time_horizon   = opp.get("time_horizon_bias", "")
+        news_impact    = opp.get("news_impact", "")
+        key_signals    = opp.get("key_signals", opp.get("key_supporting_signals", []))
+        entry_triggers = opp.get("entry_triggers", [])
+        position_sizing = opp.get("position_sizing", {})
         opp_score_line = f"  Opportunity Score : {opp_score:.4f}" if opp_score is not None else ""
+
         print(
             f"\n  Ticker        : {ticker}\n"
-            f"  Signal        : {opp['action']}\n"
-            f"  Confidence    : {confidence}\n"
-            f"  Entry Quality : {entry_quality}\n"
-            f"  Score         : {score:+d}"
-            + (f"  {opp_score_line}" if opp_score is not None else "") + "\n"
-            f"  Type          : {otype}\n"
+            f"  Decision      : {decision_tier}\n"
+            f"  Thesis        : {thesis_type}\n"
+            f"  Confidence    : {confidence}  |  Entry Quality: {entry_quality}\n"
+            f"  Quality Score : {quality_score:+d}  ({quality_tier})\n"
             f"  Sector        : {sector}\n"
         )
+        if opp_score is not None:
+            print(f"  Opportunity Score : {opp_score:.4f}")
+
+        if risk_breakdown:
+            v_  = risk_breakdown.get("volatility_risk",  "?").upper()
+            f_  = risk_breakdown.get("fundamental_risk", "?").upper()
+            s_  = risk_breakdown.get("sentiment_risk",   "?").upper()
+            print(
+                f"\n  Risk          : Volatility={v_}  |  Fundamental={f_}  |  Sentiment={s_}\n"
+                f"  Horizon       : {time_horizon}  |  News impact: {news_impact}"
+            )
+
+        if position_sizing:
+            ps_type  = position_sizing.get("type", "").upper()
+            ps_range = position_sizing.get("range", "")
+            ps_why   = position_sizing.get("rationale", "")
+            print(f"\n  Position Size : {ps_type}  {ps_range}  —  {ps_why}")
+
+        if key_signals:
+            print("\n  Key Signals (Tier 1):")
+            for s in key_signals:
+                print(f"      ✓  {s}")
+
+        if entry_triggers:
+            print("\n  Why Now:")
+            for t in entry_triggers:
+                print(f"      →  {t}")
 
         # News
         if news_sent and news_sent != "N/A":
@@ -636,8 +840,8 @@ def _print_opportunities(opportunities: List[Dict[str, Any]]) -> None:
 
         # Signals
         if signals:
-            print("\n  Quantitative Signals:")
-            for s in signals:
+            print("\n  Quality Signals:")
+            for s in opp.get("quality_signals", signals):
                 print(f"      - {s}")
 
         # Reason block
@@ -649,9 +853,12 @@ def _print_opportunities(opportunities: List[Dict[str, Any]]) -> None:
         print(light)
 
         print(f"\n  Actionable    : YES\n")
+        _ps_type  = position_sizing.get("type", "starter").upper() if position_sizing else "STARTER"
+        _ps_range = position_sizing.get("range", "") if position_sizing else ""
         print("\n  Suggested Actions:")
-        print(f"      - Execute BUY for {ticker}")
-        print(f"      - Set stop-loss below 52-week low")
+        print(f"      - Allocate {_ps_type} position ({_ps_range}) — scale on fundamental confirmation")
+        print(f"      - Validate thesis durability and portfolio sector exposure")
+        print(f"      - Set price alert at 52w low as stop-loss reference")
         print()
 
     print(f"{heavy}\n")
@@ -665,7 +872,7 @@ if __name__ == "__main__":
     _env_model = os.getenv("ALPHA_SCANNER_LLM_MODEL") or os.getenv("PORTFOLIO_LLM_MODEL")
 
     parser = argparse.ArgumentParser(
-        description="Run the AlphaScannerAgent BUY-opportunity scan."
+        description="Run the AlphaScannerAgent quality-stock BUY-opportunity scan."
     )
     parser.add_argument(
         "--tickers",
@@ -709,7 +916,7 @@ if __name__ == "__main__":
         metavar="MARKET",
         help=(
             "Market universe to scan (default: 'US'). "
-            "'US' = S&P 500 / NYSE, "
+            "'US' = Large + Mid Cap / NYSE, "
             "'IN' = NIFTY 50 / NSE, "
             "'IN_MID' = NIFTY MIDCAP 100 / NSE, "
             "'IN_SMALL' = NIFTY SMALLCAP 100 / NSE.  "

@@ -26,7 +26,7 @@ import yfinance as yf
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.agents.opportunity.state import OpportunityState
-from src.agents.opportunity.engines.signal_engine import _tier as _score_to_tier
+from src.agents.opportunity.engines.signal_engine import _quality_tier as _score_to_quality_tier, _tier as _score_to_tier
 from src.llm import get_llm, get_provider, infer_provider
 
 logger = logging.getLogger(__name__)
@@ -169,13 +169,17 @@ def _apply_fundamental_risk_penalty(state: "OpportunityState") -> "OpportunitySt
         old_score = sig["score"]
         new_score = old_score + _FUNDAMENTAL_RISK_PENALTY
         sig["score"] = new_score
-        sig["tier"]  = _score_to_tier(new_score)
+        sig["quality_score"] = new_score
+        sig["tier"] = _score_to_tier(new_score)
+        sig["quality_tier"] = _score_to_quality_tier(new_score)
         catalyst_snippet = (news.get("catalyst") or "")[:70]
-        sig["signals"] = sig.get("signals", []) + [
+        risk_signal = (
             f"\u26a0 Fundamental risk: {change_pct:.1f}% drop + negative news "
             f"\u2192 score {_FUNDAMENTAL_RISK_PENALTY:+d} "
             f"({catalyst_snippet})"
-        ]
+        )
+        sig["signals"] = sig.get("signals", []) + [risk_signal]
+        sig["quality_signals"] = sig.get("quality_signals", []) + [risk_signal]
         logger.warning(
             "[NewsNode] \u26a0 Fundamental risk — %s: drop=%.1f%%  negative news  "
             "score %+d \u2192 %+d  (falling knife guard)",

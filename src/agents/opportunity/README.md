@@ -1,4 +1,4 @@
-# AlphaScannerAgent — Opportunity Scanner
+# AlphaScannerAgent — Quality-Stock Opportunity Scanner
 
 > **Multi-agent platform** › `src/agents/opportunity/` — Live BUY Signal Scanner
 
@@ -7,9 +7,9 @@
 > Nothing it outputs constitutes financial advice or a recommendation to buy or sell any security.
 > **Do not use these signals to make real investment decisions.**
 
-A production-grade, event-driven three-stage agent that scans live market data during NYSE/NSE trading hours and surfaces high-quality **BUY** opportunities. Each candidate receives a news sentiment analysis before the final LLM decision.
+A production-grade, event-driven three-stage agent that scans live market data during NYSE/NSE trading hours and surfaces **quality-first BUY opportunities**. It ranks names by deterministic business-quality signals first, then applies news sentiment and a final LLM BUY/IGNORE decision.
 
-> **Scope constraint:** This agent only ever outputs `BUY SIGNAL` or `IGNORE`. It has no concept of SELL, REDUCE, or EXIT — those decisions belong exclusively to `PortfolioAgent`. The opportunity agent has no knowledge of your current holdings or portfolio context.
+> **Scope constraint:** This agent only ever outputs `BUY SIGNAL` or `IGNORE`. It has no concept of SELL, REDUCE, or EXIT — those decisions belong exclusively to `PortfolioAgent`. Portfolio data is used only for warning overlays, not for the core quality ranking.
 
 ---
 

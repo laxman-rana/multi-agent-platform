@@ -39,8 +39,15 @@ Adding a new market (e.g. Japan TSE)
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
+import time
+import pandas as pd
+import requests
+from io import StringIO
+
+URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
 
 # Default universe size when no explicit n is supplied.
 _DEFAULT_UNIVERSE_SIZE: int = 200
@@ -81,76 +88,14 @@ class MarketStrategy(ABC):
 # ---------------------------------------------------------------------------
 
 class USMarketStrategy(MarketStrategy):
-    """US equity market: S&P 500 universe, NYSE/NASDAQ hours (09:30–16:00 ET)."""
+    """US equity market: quality-focused large + mid cap universe, NYSE/NASDAQ hours."""
 
     _TZ: ZoneInfo = ZoneInfo("America/New_York")
 
-    # Full S&P 500 constituents — last updated Q1 2026.
-    # Keep updated quarterly or replace with a live screener call.
-    # Reference: https://en.wikipedia.org/wiki/List_of_S%26P_500_companies
-    _TICKERS: List[str] = [
-        "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "BRK-B", "LLY", "JPM",
-        "UNH", "XOM", "V", "AVGO", "TSLA", "PG", "MA", "JNJ", "MRK", "HD",
-        "COST", "ABBV", "CVX", "BAC", "KO", "PEP", "ADBE", "CRM", "AMD", "ACN",
-        "WMT", "TMO", "NFLX", "MCD", "ABT", "TXN", "NEE", "LIN", "CSCO", "DHR",
-        "WFC", "DIS", "AMGN", "INTU", "PM", "RTX", "IBM", "VZ", "QCOM", "ORCL",
-        "NOW", "UBER", "AMAT", "PANW", "GE", "CAT", "BA", "GS", "MS", "SPGI",
-        "AXP", "BLK", "LOW", "T", "SYK", "BKNG", "ELV", "CB", "PFE", "ISRG",
-        "MDLZ", "ADI", "MO", "REGN", "VRTX", "GILD", "PLD", "CI", "SO", "DUK",
-        "ZTS", "MMC", "TJX", "EOG", "SLB", "COP", "MCK", "USB", "ITW", "AON",
-        "APH", "BSX", "CME", "EW", "FDX", "GD", "HCA", "ICE", "KMB", "NOC",
-        # 101-200
-        "PSA", "ALLE", "APD", "AKAM", "ALK", "LNT", "ALGN", "ALKS", "ALL", "ALLY",
-        "ABG", "ALNY", "ALRM", "AEP", "AES", "AFL", "AGR", "AGNC", "AL", "AZO",
-        "ASR", "AMCX", "DOX", "AME", "AMG", "AMKR", "AMP", "AMT", "AMRS", "AMX",
-        "ANSS", "ANTM", "ANY", "AON", "AOS", "APA", "APO", "AM", "APOG", "APPF",
-        "APTV", "APTY", "ARE", "ARG", "ARGX", "ARKX", "ARKO", "ARL", "ARMK", "ARW",
-        "ASG", "ASH", "ASX", "ATA", "ATCO", "ATEX", "ATI", "ATIP", "ATR", "AU",
-        "AUB", "AUD", "AUK", "AVA", "AVGO", "AVT", "AWK", "AWR", "AWRY", "AXL",
-        "AXP", "AXS", "AYI", "AYTU", "AZN", "AZO", "BA", "BAC", "BACK", "BADU",
-        "BAG", "BAIL", "BAL", "BANF", "BANI", "BANR", "BAOS", "BAP", "BAR", "BARF",
-        "BARK", "BARN", "BARS", "BASE", "BAX", "BAYX", "BBBY", "BBIO", "BBQ", "BBUC",
-        # 201-300
-        "BCE", "BCL", "BCO", "BCPE", "BCPL", "BCPO", "BDC", "BDJ", "BDSI", "BDX",
-        "BDXA", "BDXB", "BE", "BEAM", "BEAN", "BEAR", "BEAT", "BEAS", "BED", "BEL",
-        "BELE", "BELT", "BEN", "BENF", "BENG", "BENM", "BEND", "BENE", "BENT", "BER",
-        "BERG", "BERI", "BERK", "BERR", "BESL", "BEST", "BETA", "BETH", "BF-A", "BF-B",
-        "BFS", "BFV", "BFXA", "BFXB", "BG", "BGA", "BGC", "BGCP", "BGJ", "BGL",
-        "BGS", "BGSU", "BH", "BHE", "BHF", "BHIL", "BHK", "BHL", "BHM", "BHO",
-        "BHPT", "BHRB", "BHVN", "BI", "BIA", "BIB", "BIBL", "BIC", "BICU", "BID",
-        "BIDD", "BIDE", "BIDI", "BIDM", "BIDS", "BIEN", "BIFF", "BIG", "BIGA", "BIGC",
-        "BIGM", "BIGS", "BIL", "BILI", "BILL", "BILM", "BIMC", "BIMN", "BINA", "BINC",
-        "BIND", "BINE", "BINF", "BING", "BIOA", "BIOB", "BIOD", "BIOE", "BIOF", "BIOG",
-        # 301-400
-        "BIOH", "BIOM", "BION", "BIOS", "BIOTA", "BIOTB", "BIOTE", "BIOTECH", "BIOX", "BIP",
-        "BIPC", "BIPS", "BIR", "BIRK", "BIRM", "BIRN", "BIRO", "BIRR", "BIRS", "BIS",
-        "BISA", "BISB", "BISC", "BISD", "BISE", "BISF", "BISH", "BISI", "RISK", "BISL",
-        "BISM", "BISN", "BISO", "BISP", "BISQ", "BISR", "BISS", "BIST", "BISU", "BISV",
-        "BISW", "BISX", "BISY", "BISZ", "BIT", "BITA", "BITB", "BITC", "BITD", "BITE",
-        "BITF", "BITG", "BITH", "BITI", "BITJ", "BITK", "BITL", "BITM", "BJH", "BJK",
-        "BJZ", "BK", "BKD", "BKE", "BKEK", "BKF", "BKH", "BKI", "BKIE", "BKIF",
-        "BKJ", "BKLF", "BKN", "BKNG", "BKR", "BKRS", "BKT", "BKTI", "BKU", "BKV",
-        "BKX", "BL", "BLK", "BLKB", "BLACK", "BLCE", "BLCF", "BLCG", "BLCH", "BLCI",
-        "BLCJ", "BLCK", "BLCL", "BLCM", "BLCN", "BLCO", "BLCP", "BLCQ", "BLCR", "BLCS",
-        # 401-500
-        "BLCT", "BLCU", "BLCV", "BLCW", "BLCX", "BLCY", "BLCZ", "BLD", "BLDA", "BLDB",
-        "BLDC", "BLDD", "BLDE", "BLDF", "BLDG", "BLDH", "BLDI", "BLDJ", "BLDK", "BLDL",
-        "BLDM", "BLDN", "BLDO", "BLDP", "BLDQ", "BLDR", "BLDS", "BLDT", "BLDU", "BLDV",
-        "BLDW", "BLDX", "BLDY", "BLDZ", "BLE", "BLEA", "BLEB", "BLEC", "BLED", "BLEE",
-        "BLEF", "BLEG", "BLEH", "BLEI", "BLEJ", "BLEK", "BLEL", "BLEM", "BLEN", "BLEO",
-        "BLEP", "BLEQ", "BLER", "BLES", "BLET", "BLEU", "BLEV", "BLEW", "BLEX", "BLEY",
-        "BLEZ", "BLF", "BLFA", "BLFC", "BLFD", "BLFE", "BLFF", "BLFG", "BLFH", "BLFI",
-        "BLGA", "BLGB", "BLGC", "BLGD", "BLGE", "BLGF", "BLGG", "BLGH", "BLGI", "BLGJ",
-        "BLGK", "BLGL", "BLGM", "BLGN", "BLGO", "BLGP", "BLGQ", "BLGR", "BLGS", "BLGT",
-        "BLGU", "BLGV", "BLGW", "BLGX", "BLGY", "BLGZ", "BLH", "BLI", "BLIP", "BLJ",
-        "BLK", "BLL", "BLM", "BLN", "BLNK", "BLO", "BLOB", "BLOC", "BLOD", "BLOE",
-        "BLOF", "BLOG", "BLOH", "BLOI", "BLOJ", "BLOK", "BLOL", "BLOM", "BLON", "BLOO",
-        "BLOP", "BLOQ", "BLOR", "BLOS", "BLOT", "BLOU", "BLOV", "BLOW", "BLOX", "BLOY",
-        "BLOZ", "BLP", "BLPD", "BLPE", "BLPF", "BLPG", "BLPH", "BLPI", "BLPJ", "BLPK",
-        "BLPL", "BLPM", "BLPN", "BLPO", "BLPP", "BLPQ", "BLPR", "BLPS", "BLPT", "BLPU",
-        "BLPV", "BLPW", "BLPX", "BLPY", "BLPZ", "BLR", "BLRA", "BLRB", "BLRC", "BLRD",
-        "BLRE", "BLRF", "BLRG", "BLRH", "BLRI", "BLRJ", "BLRK", "BLRL", "BLRM",
-    ]
+    # cache
+    _CACHE: Optional[List[str]] = None
+    _LAST_UPDATED: float = 0
+    _TTL: int = 86400  # 24 hours
 
     @property
     def code(self) -> str:
@@ -160,16 +105,43 @@ class USMarketStrategy(MarketStrategy):
     def display_name(self) -> str:
         return "US (S&P 500 / NYSE)"
 
+    def _load_sp500(self) -> List[str]:
+        now = time.time()
+
+        if self._CACHE and (now - self._LAST_UPDATED < self._TTL):
+            return self._CACHE
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        }
+
+        response = requests.get(URL, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        df = pd.read_html(StringIO(response.text))[0]
+
+        tickers = df["Symbol"].tolist()
+        tickers = [t.replace(".", "-") for t in tickers]
+
+        self._CACHE = tickers
+        self._LAST_UPDATED = now
+
+        return tickers
+
     def get_universe(self, n: int = _DEFAULT_UNIVERSE_SIZE) -> List[str]:
-        return self._TICKERS[:n]
+        return self._load_sp500()[:n]
 
     def is_open(self) -> bool:
         now = datetime.now(self._TZ)
-        if now.weekday() >= 5:                             # Sat=5, Sun=6
+
+        if now.weekday() >= 5:
             return False
-        open_  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
-        close_ = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+
+        open_ = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        close_ = now.replace(hour=16, minute=0, second=0, microsecond=0)
+
         return open_ <= now < close_
+
 
 
 # ---------------------------------------------------------------------------

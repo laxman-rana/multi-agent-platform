@@ -23,17 +23,18 @@ class OpportunityState:
     #   top_holding_weight: float
     portfolio_context: Dict[str, Any] = field(default_factory=dict)
 
-    # Extended market data per ticker (price, change_pct, volatility,
-    # pe_ratio, forward_pe, 52w_high, 52w_low, sector, volume, avg_volume)
+    # Extended market + quality-factor data per ticker (price, change_pct,
+    # volatility, valuation, margins, ROE, leverage, FCF, growth, etc.)
     market_data: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     # Tickers that passed the PreFilterEngine lightweight checks
     prefiltered: List[str] = field(default_factory=list)
 
-    # SignalEngine output per ticker: {score, signals, tier}
+    # SignalEngine output per ticker: {score, quality_score, quality_tier,
+    # signals, quality_signals, tier, type, opportunity_score}
     signals: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-    # Tickers with score >= 1 and a clear cooldown window
+    # Top-ranked tickers with quality_score above threshold and a clear cooldown window
     candidates: List[str] = field(default_factory=list)
 
     # Tickers that passed score but were suppressed by cooldown in the scanner.
