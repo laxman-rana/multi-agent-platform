@@ -170,8 +170,10 @@ Example request:
 ```bash
 curl -X POST http://localhost:8000/api/v1/opportunity/scan ^
   -H "Content-Type: application/json" ^
-  -d "{\"tickers\":[\"AAPL\",\"MSFT\",\"NVDA\"]}"
+  -d "{\"tickers\":[\"AAPL\",\"MSFT\",\"NVDA\"],\"market\":\"US\"}"
 ```
+
+`market` is optional and defaults to `US`. Supported values are `US`, `IN`, `IN_MID`, and `IN_SMALL`.
 
 The API reads `PORT` automatically, so it can run on most container-friendly cloud platforms. For example:
 

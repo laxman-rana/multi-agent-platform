@@ -125,10 +125,15 @@ class OpportunityScanRequest(BaseModel):
         ...,
         description="Ticker symbols to scan, for example ['AAPL', 'MSFT', 'NVDA'].",
     )
+    market: str = Field(
+        default="US",
+        description="Market universe. Supported values: US, IN, IN_MID, IN_SMALL.",
+    )
 
 
 class OpportunityScanResponse(BaseModel):
     tickers: list[str]
+    market: str
     opportunity_count: int
     opportunities: list[dict[str, Any]]
 
@@ -230,15 +235,19 @@ def health() -> dict[str, str]:
 @limiter.limit(_SCAN_RATE_LIMIT)
 def scan_opportunities(request: Request, payload: OpportunityScanRequest) -> JSONResponse:
     if _CACHE_ENABLED:
-        cache_key = _hash_cache_key("opportunity_scan", {"tickers": payload.tickers})
+        cache_key = _hash_cache_key(
+            "opportunity_scan",
+            {"tickers": payload.tickers, "market": payload.market},
+        )
         cached = cache.get(cache_key)
         if cached is not None:
             return _json_response(OpportunityScanResponse(**cached), cache_status="HIT")
 
-    tickers, opportunities = run_opportunity_scan(payload.tickers)
+    tickers, market, opportunities = run_opportunity_scan(payload.tickers, market=payload.market)
 
     response_payload = OpportunityScanResponse(
         tickers=tickers,
+        market=market,
         opportunity_count=len(opportunities),
         opportunities=opportunities,
     )

@@ -25,11 +25,26 @@ def normalize_tickers(tickers: list[str]) -> list[str]:
     return normalized
 
 
-def run_opportunity_scan(tickers: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
+def normalize_market(market: str | None) -> str:
+    value = (market or "US").strip().upper()
+    allowed = {"US", "IN", "IN_MID", "IN_SMALL"}
+    if value not in allowed:
+        raise HTTPException(
+            status_code=422,
+            detail="Market must be one of: US, IN, IN_MID, IN_SMALL.",
+        )
+    return value
+
+
+def run_opportunity_scan(
+    tickers: list[str],
+    market: str = "US",
+) -> tuple[list[str], str, list[dict[str, Any]]]:
     normalized = normalize_tickers(tickers)
+    normalized_market = normalize_market(market)
 
     try:
-        opportunities = trigger_scan(tickers=normalized)
+        opportunities = trigger_scan(tickers=normalized, market=normalized_market)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ImportError as exc:
@@ -37,4 +52,4 @@ def run_opportunity_scan(tickers: list[str]) -> tuple[list[str], list[dict[str, 
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Opportunity scan failed: {exc}") from exc
 
-    return normalized, opportunities
+    return normalized, normalized_market, opportunities
