@@ -183,6 +183,22 @@ For browser frontends, configure `API_CORS_ALLOW_ORIGINS` with a comma-separated
 
 For production, you can disable interactive API docs with `API_ENABLE_DOCS=false`.
 
+You can also tune in-memory API rate limits with:
+
+- `API_ENABLE_RATE_LIMITS=true`
+- `API_RATE_LIMIT_STRATEGY=moving-window`
+- `API_RATE_LIMIT_ASSISTANT_QUERY=5/minute`
+- `API_RATE_LIMIT_OPPORTUNITY_SCAN=10/minute`
+- `API_RATE_LIMIT_WHATSAPP_WEBHOOK=10/minute`
+
+Rate limit strategy notes:
+
+- `fixed-window`: Uses one counter for a whole time bucket such as `5/minute`. It is fast and memory-efficient, but it can allow bursts near the edge of the window. Example: a client may send several requests at the end of one minute and several more immediately after the next minute starts.
+- `moving-window`: Uses a true rolling window based on request timestamps. It is stricter than fixed-window and better at preventing boundary bursts, but it uses a little more memory and bookkeeping.
+- `sliding-window-counter`: Approximates a rolling window by combining counts from the current and previous buckets. It is a middle ground between fixed-window and moving-window: less bursty than fixed-window, but usually cheaper than a full moving-window log.
+
+This project currently uses `moving-window` for the API because the expensive endpoints can trigger live market-data fetches and LLM calls. On a single-container Railway deployment with a small budget, the main risk is burst traffic slipping through at window boundaries, so the stricter rolling-window behavior is the safer default.
+
 The WhatsApp webhook endpoint accepts an inbound message payload, extracts ticker symbols from text like `scan nvda msft`, runs the same opportunity scan service, and returns a reply payload your messaging provider integration can send back to the user.
 
 ## Technologies Used

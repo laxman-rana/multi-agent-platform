@@ -7,6 +7,10 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
 
 from src.api.opportunity_service import run_opportunity_scan
 from src.api.supervisor_service import run_supervisor_query
@@ -25,6 +29,25 @@ def _parse_cors_origins() -> list[str]:
     if not raw:
         return ["*"]
     return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+def _client_ip_key(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for:
+        client_ip = forwarded_for.split(",", 1)[0].strip()
+        if client_ip:
+            return client_ip
+
+    real_ip = request.headers.get("x-real-ip", "").strip()
+    if real_ip:
+        return real_ip
+
+    return get_remote_address(request)
+
+
+def _env_rate_limit(name: str, default: str) -> str:
+    raw = os.getenv(name, default).strip()
+    return raw or default
 
 
 class OpportunityScanRequest(BaseModel):
@@ -70,6 +93,18 @@ class WhatsAppWebhookResponse(BaseModel):
 
 
 _DOCS_ENABLED = _env_flag("API_ENABLE_DOCS", default=True)
+_RATE_LIMITS_ENABLED = _env_flag("API_ENABLE_RATE_LIMITS", default=True)
+_ASSISTANT_RATE_LIMIT = _env_rate_limit("API_RATE_LIMIT_ASSISTANT_QUERY", "5/minute")
+_SCAN_RATE_LIMIT = _env_rate_limit("API_RATE_LIMIT_OPPORTUNITY_SCAN", "10/minute")
+_WHATSAPP_RATE_LIMIT = _env_rate_limit("API_RATE_LIMIT_WHATSAPP_WEBHOOK", "10/minute")
+_RATE_LIMIT_STRATEGY = os.getenv("API_RATE_LIMIT_STRATEGY", "moving-window").strip() or "moving-window"
+
+limiter = Limiter(
+    key_func=_client_ip_key,
+    enabled=_RATE_LIMITS_ENABLED,
+    headers_enabled=True,
+    strategy=_RATE_LIMIT_STRATEGY,
+)
 
 
 app = FastAPI(
@@ -83,6 +118,8 @@ app = FastAPI(
     redoc_url="/redoc" if _DOCS_ENABLED else None,
     openapi_url="/openapi.json" if _DOCS_ENABLED else None,
 )
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -91,6 +128,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(SlowAPIMiddleware)
 
 
 @app.get("/")
@@ -114,7 +152,8 @@ def health() -> dict[str, str]:
 
 
 @app.post("/api/v1/opportunity/scan", response_model=OpportunityScanResponse)
-def scan_opportunities(payload: OpportunityScanRequest) -> OpportunityScanResponse:
+@limiter.limit(_SCAN_RATE_LIMIT)
+def scan_opportunities(request: Request, payload: OpportunityScanRequest) -> OpportunityScanResponse:
     tickers, opportunities = run_opportunity_scan(payload.tickers)
 
     return OpportunityScanResponse(
@@ -125,7 +164,8 @@ def scan_opportunities(payload: OpportunityScanRequest) -> OpportunityScanRespon
 
 
 @app.post("/api/v1/assistant/query", response_model=AssistantQueryResponse)
-def assistant_query(payload: AssistantQueryRequest) -> AssistantQueryResponse:
+@limiter.limit(_ASSISTANT_RATE_LIMIT)
+def assistant_query(request: Request, payload: AssistantQueryRequest) -> AssistantQueryResponse:
     result = run_supervisor_query(message=payload.message, model=payload.model)
     return AssistantQueryResponse(**result)
 
@@ -145,6 +185,7 @@ async def _read_webhook_payload(request: Request) -> dict[str, Any]:
 
 
 @app.post("/webhooks/whatsapp", response_model=WhatsAppWebhookResponse)
+@limiter.limit(_WHATSAPP_RATE_LIMIT)
 async def whatsapp_webhook(request: Request) -> WhatsAppWebhookResponse:
     payload = await _read_webhook_payload(request)
 
