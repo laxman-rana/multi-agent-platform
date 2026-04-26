@@ -281,7 +281,10 @@ def main(skip_news: bool = False, model: str | None = None) -> None:
 
 
 if __name__ == "__main__":
+    from src.llm.providers import default_model_for
+
     _env_model = os.getenv("PORTFOLIO_LLM_MODEL")
+    _default_display = _env_model or f"default: {default_model_for('ollama')} / ollama"
 
     parser = argparse.ArgumentParser(description="Run the portfolio analysis workflow.")
     parser.add_argument(
@@ -295,7 +298,7 @@ if __name__ == "__main__":
         metavar="MODEL_NAME",
         help=(
             "Model to use. Provider is inferred automatically from the model name. "
-            f"(current: '{_env_model or 'default: gpt-oss:120b / ollama'}') "
+            f"(current: '{_default_display}') "
             "Examples: gpt-4o, gemini-1.5-pro, llama3, gpt-4-turbo."
         ),
     )

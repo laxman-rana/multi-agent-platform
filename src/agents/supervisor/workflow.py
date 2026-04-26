@@ -286,7 +286,10 @@ def run(query: str, model: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    from src.llm.providers import default_model_for
+
     _env_model = os.getenv("PORTFOLIO_LLM_MODEL")
+    _default_display = _env_model or f"default: {default_model_for('ollama')} / ollama"
 
     parser = argparse.ArgumentParser(
         description="Run the supervisor/worker multi-agent orchestrator.",
@@ -312,7 +315,7 @@ Examples:
         metavar="MODEL_NAME",
         help=(
             "LLM model override. Provider is inferred automatically from the model name. "
-            f"(current: '{_env_model or 'default: gpt-oss:120b / ollama'}') "
+            f"(current: '{_default_display}') "
             "Examples: gpt-4o, gemini-1.5-pro, llama3."
         ),
     )

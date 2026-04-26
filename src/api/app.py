@@ -9,10 +9,20 @@ from collections import OrderedDict
 from urllib.parse import parse_qs
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+from src.api.auth import (
+    create_access_request,
+    exchange_api_key,
+    generate_and_store_key,
+    require_auth,
+    require_internal,
+    send_api_key_email,
+    send_new_request_notification,
+)
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -120,6 +130,42 @@ def _json_response(payload: BaseModel, cache_status: str | None = None) -> JSONR
     return JSONResponse(content=payload.model_dump(), headers=headers)
 
 
+class AccessRequest(BaseModel):
+    name: str = Field(..., description="Your full name.")
+    email: str = Field(..., description="Email address where your API key will be sent.")
+    reason: str | None = Field(default=None, description="Brief description of how you plan to use the API.")
+
+
+class AccessRequestResponse(BaseModel):
+    id: str
+    message: str
+
+
+class InternalNotifyRequest(BaseModel):
+    event: str
+    id: str
+    name: str
+    email: str
+    reason: str | None = None
+
+
+class InternalSendKeyRequest(BaseModel):
+    event: str
+    id: str
+    name: str
+    email: str
+
+
+class TokenRequest(BaseModel):
+    api_key: str = Field(..., description="Your pre-shared API key secret.")
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_at: int = Field(..., description="Unix timestamp when the token expires.")
+
+
 class OpportunityScanRequest(BaseModel):
     tickers: list[str] = Field(
         ...,
@@ -211,12 +257,97 @@ app.add_middleware(
 app.add_middleware(SlowAPIMiddleware)
 
 
+@app.post(
+    "/auth/token",
+    response_model=TokenResponse,
+    summary="Exchange an API key for a JWT access token",
+    tags=["auth"],
+)
+def get_token(body: TokenRequest) -> TokenResponse:
+    """Trade a pre-shared API key for a short-lived JWT.
+
+    Include the returned token in subsequent requests as:
+    ``Authorization: Bearer <access_token>``
+    """
+    token, expires_at = exchange_api_key(body.api_key)
+    return TokenResponse(access_token=token, expires_at=expires_at)
+
+
+@app.post(
+    "/access/request",
+    response_model=AccessRequestResponse,
+    summary="Request API access",
+    tags=["auth"],
+)
+def request_access(body: AccessRequest) -> AccessRequestResponse:
+    """Submit a request for API access.
+
+    You will receive an email with your API key once approved.
+    """
+    row = create_access_request(
+        name=body.name,
+        email=body.email,
+        reason=body.reason or "",
+    )
+    # Notify admin — fire and forget (errors are logged, not raised)
+    send_new_request_notification(
+        name=body.name,
+        email=body.email,
+        reason=body.reason or "",
+        request_id=row.get("id", ""),
+    )
+    return AccessRequestResponse(
+        id=row.get("id", ""),
+        message="Request received. You will get an email when approved.",
+    )
+
+
+@app.post(
+    "/internal/notify-request",
+    include_in_schema=False,
+)
+def internal_notify_request(
+    request: Request,
+    body: InternalNotifyRequest,
+    _: None = Depends(require_internal),
+) -> dict:
+    """Called by Supabase trigger when a new request row is inserted.
+    Sends admin notification email. Returns immediately — email is best-effort.
+    """
+    send_new_request_notification(
+        name=body.name,
+        email=body.email,
+        reason=body.reason or "",
+        request_id=body.id,
+    )
+    return {"ok": True}
+
+
+@app.post(
+    "/internal/send-key",
+    include_in_schema=False,
+)
+def internal_send_key(
+    request: Request,
+    body: InternalSendKeyRequest,
+    _: None = Depends(require_internal),
+) -> dict:
+    """Called by Supabase trigger when status is set to 'approved'.
+    Generates the API key, stores its hash in Supabase, emails the key.
+    """
+    raw_key = generate_and_store_key(body.id)
+    send_api_key_email(name=body.name, email=body.email, raw_key=raw_key)
+    return {"ok": True}
+
+
 @app.get("/")
 def root() -> dict[str, str]:
     payload = {
         "service": "multi-agent-platform",
         "status": "ok",
         "health": "/health",
+        "request_access": "/access/request",
+        "auth": "/auth/token",
         "opportunity_scan": "/api/v1/opportunity/scan",
         "assistant_query": "/api/v1/assistant/query",
         "whatsapp_webhook": "/webhooks/whatsapp",
@@ -233,7 +364,11 @@ def health() -> dict[str, str]:
 
 @app.post("/api/v1/opportunity/scan", response_model=OpportunityScanResponse)
 @limiter.limit(_SCAN_RATE_LIMIT)
-def scan_opportunities(request: Request, payload: OpportunityScanRequest) -> JSONResponse:
+def scan_opportunities(
+    request: Request,
+    payload: OpportunityScanRequest,
+    _auth: dict = Depends(require_auth),
+) -> JSONResponse:
     if _CACHE_ENABLED:
         cache_key = _hash_cache_key(
             "opportunity_scan",
@@ -258,7 +393,11 @@ def scan_opportunities(request: Request, payload: OpportunityScanRequest) -> JSO
 
 @app.post("/api/v1/assistant/query", response_model=AssistantQueryResponse)
 @limiter.limit(_ASSISTANT_RATE_LIMIT)
-def assistant_query(request: Request, payload: AssistantQueryRequest) -> JSONResponse:
+def assistant_query(
+    request: Request,
+    payload: AssistantQueryRequest,
+    _auth: dict = Depends(require_auth),
+) -> JSONResponse:
     if _CACHE_ENABLED:
         cache_key = _hash_cache_key(
             "assistant_query",
@@ -291,7 +430,10 @@ async def _read_webhook_payload(request: Request) -> dict[str, Any]:
 
 @app.post("/webhooks/whatsapp", response_model=WhatsAppWebhookResponse)
 @limiter.limit(_WHATSAPP_RATE_LIMIT)
-async def whatsapp_webhook(request: Request) -> WhatsAppWebhookResponse:
+async def whatsapp_webhook(
+    request: Request,
+    _auth: dict = Depends(require_auth),
+) -> WhatsAppWebhookResponse:
     payload = await _read_webhook_payload(request)
 
     message = str(
