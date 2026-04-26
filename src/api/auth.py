@@ -45,6 +45,17 @@ from supabase import Client, create_client
 # Config
 # ---------------------------------------------------------------------------
 
+domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+API_BASE_URL = os.getenv("API_BASE_URL")
+
+if not API_BASE_URL:
+    if domain:
+        API_BASE_URL = f"https://{domain}"
+    else:
+        API_BASE_URL = "http://localhost:8000"
+
+API_BASE_URL = API_BASE_URL.rstrip("/")
+
 def _require_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
@@ -279,20 +290,39 @@ def send_api_key_email(name: str, email: str, raw_key: str) -> None:
         subject="Your Multi-Agent Platform API Key",
         html=f"""
         <h2>Welcome, {name}!</h2>
+
         <p>Your access request has been approved. Here is your API key:</p>
-        <pre style="background:#f4f4f4;padding:12px;border-radius:6px;font-size:15px">{raw_key}</pre>
+
+        <pre style="background:#f4f4f4;padding:12px;border-radius:6px;font-size:15px">
+        {raw_key}
+        </pre>
+
         <h3>Quick start</h3>
+
         <p><b>Step 1 — exchange your key for a short-lived JWT (valid 60 min):</b></p>
-        <pre style="background:#f4f4f4;padding:12px;border-radius:6px">curl -X POST https://your-app.railway.app/auth/token \\
-  -H "Content-Type: application/json" \\
-  -d '{{"api_key": "{raw_key}"}}'</pre>
+
+        <pre style="background:#f4f4f4;padding:12px;border-radius:6px">
+        curl -X POST {API_BASE_URL}/auth/token \\
+        -H "Content-Type: application/json" \\
+        -d '{{"api_key": "{raw_key}"}}'
+        </pre>
+
         <p><b>Step 2 — call the API:</b></p>
-        <pre style="background:#f4f4f4;padding:12px;border-radius:6px">curl -X POST https://your-app.railway.app/api/v1/assistant/query \\
-  -H "Authorization: Bearer &lt;your_token&gt;" \\
-  -H "Content-Type: application/json" \\
-  -d '{{"message": "Should I buy AAPL?"}}'</pre>
+
+        <pre style="background:#f4f4f4;padding:12px;border-radius:6px">
+        curl -X POST {API_BASE_URL}/api/v1/assistant/query \\
+        -H "Authorization: Bearer &lt;your_token&gt;" \\
+        -H "Content-Type: application/json" \\
+        -d '{{"message": "Should I buy AAPL?"}}'
+        </pre>
+
+        <p>
+        You can also explore the API docs here:
+        <a href="{API_BASE_URL}/docs">{API_BASE_URL}/docs</a>
+        </p>
+
         <p>Keep your key private. Reply to this email if you need it rotated.</p>
-        """,
+        """
     )
 
 
