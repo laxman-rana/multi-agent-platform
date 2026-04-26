@@ -191,6 +191,15 @@ You can also tune in-memory API rate limits with:
 - `API_RATE_LIMIT_OPPORTUNITY_SCAN=10/minute`
 - `API_RATE_LIMIT_WHATSAPP_WEBHOOK=10/minute`
 
+You can also enable a short-lived in-memory cache for expensive API calls:
+
+- `API_ENABLE_CACHE=true`
+- `API_CACHE_MAX_ENTRIES=256`
+- `API_CACHE_TTL_ASSISTANT_QUERY_SECONDS=180`
+- `API_CACHE_TTL_OPPORTUNITY_SCAN_SECONDS=120`
+
+This cache is TTL-based rather than plain LRU because freshness matters for market-facing responses. It helps absorb repeated identical requests over a short period without serving old answers for too long.
+
 Rate limit strategy notes:
 
 - `fixed-window`: Uses one counter for a whole time bucket such as `5/minute`. It is fast and memory-efficient, but it can allow bursts near the edge of the window. Example: a client may send several requests at the end of one minute and several more immediately after the next minute starts.
