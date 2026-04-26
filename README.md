@@ -173,7 +173,7 @@ curl -X POST http://localhost:8000/api/v1/opportunity/scan ^
   -d "{\"tickers\":[\"AAPL\",\"MSFT\",\"NVDA\"]}"
 ```
 
-The API reads `PORT` automatically, so a Railway start command can be:
+The API reads `PORT` automatically, so it can run on most container-friendly cloud platforms. For example:
 
 ```bash
 python -m src.api.server
@@ -197,9 +197,15 @@ Rate limit strategy notes:
 - `moving-window`: Uses a true rolling window based on request timestamps. It is stricter than fixed-window and better at preventing boundary bursts, but it uses a little more memory and bookkeeping.
 - `sliding-window-counter`: Approximates a rolling window by combining counts from the current and previous buckets. It is a middle ground between fixed-window and moving-window: less bursty than fixed-window, but usually cheaper than a full moving-window log.
 
-This project currently uses `moving-window` for the API because the expensive endpoints can trigger live market-data fetches and LLM calls. On a single-container Railway deployment with a small budget, the main risk is burst traffic slipping through at window boundaries, so the stricter rolling-window behavior is the safer default.
+This project currently uses `moving-window` for the API because the expensive endpoints can trigger live market-data fetches and LLM calls. On a single-container deployment with a small budget, the main risk is burst traffic slipping through at window boundaries, so the stricter rolling-window behavior is the safer default.
 
 The WhatsApp webhook endpoint accepts an inbound message payload, extracts ticker symbols from text like `scan nvda msft`, runs the same opportunity scan service, and returns a reply payload your messaging provider integration can send back to the user.
+
+Deployment note:
+
+- the application itself is cloud-agnostic
+- `railway.json` is included only as an example deployment config for Railway
+- the same app can be deployed on other Python/container platforms by installing `requirements.txt` and starting `python -m src.api.server`
 
 ## Technologies Used
 

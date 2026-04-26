@@ -32,6 +32,7 @@ def _parse_cors_origins() -> list[str]:
 
 
 def _client_ip_key(request: Request) -> str:
+    """Resolve the best client IP from common reverse-proxy headers."""
     forwarded_for = request.headers.get("x-forwarded-for", "")
     if forwarded_for:
         client_ip = forwarded_for.split(",", 1)[0].strip()
